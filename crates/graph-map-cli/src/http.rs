@@ -28,7 +28,7 @@ const LOGO_SVG: &str = include_str!("../web/icons/logo.svg");
 const UI_JS: &str = include_str!("../web/assets/graph_map_ui.js");
 const UI_WASM: &[u8] = include_bytes!("../web/assets/graph_map_ui_bg.wasm");
 
-const CSP: &str = "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+const CSP: &str = "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 
 pub const GRAPH_MAP_QUERY_PARAMS: &[&str] = &[
     "scope",

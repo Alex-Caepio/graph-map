@@ -419,8 +419,25 @@ fn http_serve_ui_wasm_csp_and_api_roundtrip() {
 
     let (st, head, html) = http_request(&addr, &format!("GET / HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"));
     assert_eq!(st, 200);
-    assert!(head.to_ascii_lowercase().contains("content-security-policy:"));
+    let head_lower = head.to_ascii_lowercase();
+    assert!(head_lower.contains("content-security-policy:"));
+    assert!(
+        head_lower.contains("style-src 'self' 'unsafe-inline'"),
+        "missing inline style CSP for WASM positioning: {head}"
+    );
+    assert!(
+        head_lower.contains("'wasm-unsafe-eval'"),
+        "missing wasm CSP directive: {head}"
+    );
     assert!(String::from_utf8_lossy(&html).contains("id=\"graph-map\""));
+
+    let (st, js_head, js_body) = http_request(
+        &addr,
+        &format!("GET /assets/graph_map_ui.js HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"),
+    );
+    assert_eq!(st, 200);
+    assert!(js_head.to_ascii_lowercase().contains("style-src 'self' 'unsafe-inline'"));
+    assert!(!js_body.is_empty());
 
     let (st, _, wasm) = http_request(
         &addr,
