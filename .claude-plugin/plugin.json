@@ -1,0 +1,20 @@
+{
+  "name": "graph-map",
+  "version": "0.1.0",
+  "description": "Standalone interactive code-graph explorer for codebase dependencies, Git commits, pull requests, architectural layers, and AI coding run impact",
+  "author": {
+    "name": "Alex-Caepio",
+    "url": "https://github.com/Alex-Caepio/graph-map"
+  },
+  "homepage": "https://github.com/Alex-Caepio/graph-map",
+  "repository": "https://github.com/Alex-Caepio/graph-map",
+  "license": "Apache-2.0",
+  "keywords": [
+    "code-graph",
+    "dependency-map",
+    "architecture",
+    "git-impact",
+    "mcp",
+    "wasm"
+  ]
+}

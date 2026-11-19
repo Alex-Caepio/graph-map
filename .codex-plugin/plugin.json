@@ -1,0 +1,32 @@
+{
+  "name": "graph-map",
+  "version": "0.1.0",
+  "description": "Standalone interactive code-graph explorer for codebase dependencies, Git commits, pull requests, architectural layers, and AI coding run impact",
+  "author": {
+    "name": "Alex-Caepio",
+    "url": "https://github.com/Alex-Caepio/graph-map"
+  },
+  "homepage": "https://github.com/Alex-Caepio/graph-map",
+  "repository": "https://github.com/Alex-Caepio/graph-map",
+  "skills": "./skills/",
+  "mcpServers": "./.codex-mcp.json",
+  "interface": {
+    "displayName": "Graph Map",
+    "shortDescription": "Interactive project, commit, and current-work code graph explorer",
+    "longDescription": "Explore file, symbol, folder, layer, scenario, commit, pull-request, and Claude/Codex agent-run dependencies via CLI, 14 MCP tools, and an embedded localhost WASM UI.",
+    "developerName": "Alex-Caepio",
+    "category": "Coding",
+    "capabilities": [
+      "Interactive",
+      "Read"
+    ],
+    "brandColor": "#6841C6",
+    "composerIcon": "./assets/logo.svg",
+    "logo": "./assets/logo.svg",
+    "defaultPrompt": [
+      "Map current work impact and test reach",
+      "Audit architectural layers and cyclic dependencies",
+      "Trace a runtime scenario or compare an AI run against its change"
+    ]
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "graph-map": {
+      "command": "${CLAUDE_PLUGIN_ROOT}/bin/graph-map",
+      "args": ["mcp"]
+    }
+  }
+}

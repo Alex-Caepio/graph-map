@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "graph-map": {
+      "command": "./bin/graph-map",
+      "args": ["mcp"],
+      "cwd": ".",
+      "tool_timeout_sec": 300
+    }
+  }
+}
