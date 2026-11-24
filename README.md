@@ -1,14 +1,14 @@
 # Graph Map (`graph-map`)
 
-Standalone interactive code-graph explorer for codebase dependencies, Git commits, pull requests, architectural layers, test reach, and AI coding run audits — packaged as a native Rust CLI, stdio JSON-RPC 2.0 MCP server (14 tools), embedded localhost WASM UI, and dual Claude Code / Codex CLI plugin.
+Standalone interactive code-graph explorer for codebase dependencies, Git commits, `A..B` commit ranges, pull requests, architectural layers, linked project memory, test reach, and AI coding run audits — packaged as a native Rust CLI, stdio JSON-RPC 2.0 MCP server (16 tools), embedded localhost Canvas2D WASM UI, and dual Claude Code / Codex CLI plugin.
 
 ## Capabilities
 
-- **Codebase & Change Impact Mapping**: Explore folders, files, symbols, shortest paths, shared coupling, downstream scenarios, cycles, architectural layers (`.graph-map/layers` rules), and Rust Cargo crate graphs (`graph_crates`).
-- **Git & Target Diffs**: Map `work`, `uncommitted`, `commit:<sha>`, `branch:<name>`, `pull:<number>`, stacked PR base comparisons, and co-change commit hotspots.
-- **Test Reach**: Compute shortest transitive incoming dependency chains from test files to modified files.
-- **Multi-Host Agent Run Audits**: Read run transcripts directly from Harness event JSON (`.graph-map/runs/*.json`), Claude Code JSONL (`~/.claude/projects/`), and Codex CLI JSONL (`~/.codex/sessions/`) to see what an agent changed vs what dependent files it actually opened or shell-read.
-- **Embedded Interactive WASM UI**: Zero external web asset dependencies — compiled WASM, JS, CSS, SVG, and HTML are embedded inside `./bin/graph-map` and served from `http://127.0.0.1:7840`.
+- **Native 13-Language AST + Incremental SQLite IR**: Indexes Rust, PHP, TypeScript/TSX, JavaScript, Python, Go, Java, C#, C, C++, Ruby, HTML, and CSS natively via tree-sitter into SQLite IR without requiring Python or `graphify` (optional external `graphify` or `graph.json` import remain supported).
+- **Codebase & Change Impact Mapping**: Explore progressive `overview` / `folder` / `file` / `symbol` LOD slices, `min_weight` edge filtering, shortest/near-shortest paths, shared coupling, downstream scenarios, cycles, architectural layers (`.graph-map/layers` / `.harness-architecture.json`), and Rust Cargo crate graphs (`graph_crates`).
+- **Git Ranges, PRs & Memory Links**: Map `work`, `uncommitted`, `commit:<sha>`, `ref:<name>`, `pr:<number>`, `range:<from>..<to>`, stacked PR base comparisons, per-file blast reports (`file-impact`), co-change hotspots, and Project Brain / Memory Bank citations (`memory-links`).
+- **Test Reach & Multi-Host Agent Run Audits**: Compute shortest transitive incoming test chains to modified files, and audit Harness (`.graph-map/runs/*.json`), Claude Code (`~/.claude/projects/`), and Codex (`~/.codex/sessions/`) transcripts against what an agent edited vs opened.
+- **Embedded Interactive Canvas2D WASM UI**: Zero external web asset dependencies — 5 analytical lenses, commit DAG browser, display/LOD controls, SSE `/api/events/stream` updates, and dense Canvas2D rendering compiled to WASM and embedded inside `./bin/graph-map` (`http://127.0.0.1:7840`).
 
 ## Installation & Plugin Setup
 
@@ -44,15 +44,19 @@ The prebuilt Linux x86-64 binary lives at `./bin/graph-map`.
 ## CLI Usage
 
 ```bash
+./bin/graph-map --project /path/to/repo build
 ./bin/graph-map --project /path/to/repo status --check
-./bin/graph-map --project /path/to/repo build --import /path/to/graph.json
+./bin/graph-map --project /path/to/repo map --lod folder --min-weight 2
 ./bin/graph-map --project /path/to/repo find Order --json
-./bin/graph-map --project /path/to/repo neighbors src/Service/OrderService.php
+./bin/graph-map --project /path/to/repo neighbors src/Service/OrderService.php --depth 2
 ./bin/graph-map --project /path/to/repo link src/A.php src/B.php
-./bin/graph-map --project /path/to/repo path src/A.php src/C.php
+./bin/graph-map --project /path/to/repo path src/A.php src/C.php --longer 1
 ./bin/graph-map --project /path/to/repo shared src/A.php src/B.php --side both_use
 ./bin/graph-map --project /path/to/repo cycles src/A.php
-./bin/graph-map --project /path/to/repo impact work
+./bin/graph-map --project /path/to/repo impact --from main --to HEAD --lod file
+./bin/graph-map --project /path/to/repo changes --from main --to HEAD
+./bin/graph-map --project /path/to/repo file-impact src/Entity/Order.php work
+./bin/graph-map --project /path/to/repo memory-links src/Entity/Order.php
 ./bin/graph-map --project /path/to/repo layers --modules
 ./bin/graph-map --project /path/to/repo scenario src/Controller/OrderController.php
 ./bin/graph-map --project /path/to/repo test-reach work
@@ -63,22 +67,24 @@ The prebuilt Linux x86-64 binary lives at `./bin/graph-map`.
 ./bin/graph-map mcp
 ```
 
-## MCP Tools (14)
+## MCP Tools (16)
 
-- `graph_status` — Graph availability, node/edge counts, staleness, build progress
-- `graph_build` — Enable, build (`GRAPH_MAP_GRAPHIFY`/`graphify`), rebuild, or import `graph.json`
+- `graph_status` — Graph availability, backend, node/edge counts, staleness, build progress
+- `graph_build` — Build native 13-language AST/SQLite IR (or optional `graphify` / `import` `graph.json`)
 - `graph_find` — Search files, folders, classes, functions, methods
-- `graph_neighbors` — Step-by-step caller/callee neighborhood unfolding (`out`, `into`)
+- `graph_neighbors` — Caller/callee unfolding (`depth`, `out`, `into`, `lod`, `min_weight`)
 - `graph_link` — Symbol-level edge inspection between two places
-- `graph_path` — Shortest directed dependency path between two places
+- `graph_path` — Shortest and near-shortest (`longer`) directed paths between two places
 - `graph_shared` — Shared callees (`both_use`) or shared callers (`uses_both`)
 - `graph_cycle` — Shortest cycle tracing back to an origin
-- `graph_change_impact` — Impact map for `work`, `uncommitted`, commits, branches, PRs, or runs
-- `graph_architecture` — Layering, violations, design patterns, module boundaries
+- `graph_change_impact` — Impact map for `work`, `uncommitted`, commits, `from`/`to` ranges, PRs, or runs
+- `graph_architecture` — Layering, violations, design patterns, module boundaries, root nodes
 - `graph_scenario` — Forward directed execution trace from an entry point
 - `graph_test_reach` — Shortest transitive incoming test paths to modified files
 - `graph_history_hotspots` — Git co-change hotspots and commit history browser
 - `graph_run_audit` — List or audit Claude Code, Codex, and Harness runs
+- `graph_file_impact` — Structured per-file blast radius, symbol diffs, and reaching tests
+- `graph_memory_links` — Lookup Project Brain and Memory Bank citations for single or batch files
 
 ## State & Graph Resolution
 

@@ -1,6 +1,6 @@
 {
   "name": "graph-map",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Standalone interactive code-graph explorer for codebase dependencies, Git commits, pull requests, architectural layers, and AI coding run impact",
   "author": {
     "name": "Alex-Caepio",

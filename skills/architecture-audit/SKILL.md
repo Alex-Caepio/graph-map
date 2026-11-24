@@ -14,11 +14,12 @@ Always pass `project: "<absolute-repository-root>"` explicitly to every `graph_*
 ## Procedure
 
 1. **Ensure graph availability**:
-   Call `graph_status` with `{ "project": "<repo-root>", "check": true }`. Build or import if needed via `graph_build`.
+   Call `graph_status` with `{ "project": "<repo-root>", "check": true }`. Build natively or import if needed via `graph_build`.
 2. **Audit layers, patterns, or modules**:
    - Call `graph_architecture` with `{ "project": "<repo-root>" }` to inspect inferred architectural rings/layers and violations, plus `.graph-map/layers` rules if present in the repo.
+   - Pass `lod` (`"overview"`, `"folder"`, `"file"`, `"symbol"`) and `min_weight` to slice large codebases progressively, and `no_incoming: true` to surface root/dead-code candidates without incoming callers.
    - Pass `pattern: "layers@"` for direct layer violation focus, or `modules: true` for community module boundaries.
-   - Pass `target: "work"` (or `commit:<sha>`, `pull:<num>`) and `base: "<sha>"` to check whether a change added or resolved violations.
+   - Pass `target: "work"` (or `commit:<sha>`, `pr:<num>`, `range:<from>..<to>`, or `from`+`to`) and `base: "<sha-or-ref>"` to check whether a change added or resolved violations.
 3. **Trace cyclic dependencies**:
    Call `graph_cycle` with `{ "project": "<repo-root>", "cycle": "<file-or-folder>" }` to find the shortest directed cycle back to the origin.
 4. **Inspect shared coupling & hotspots**:

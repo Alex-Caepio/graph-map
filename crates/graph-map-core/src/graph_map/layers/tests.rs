@@ -492,11 +492,46 @@ fn a_folder_that_keeps_its_code_in_rings_is_read_by_them() {
     assert_eq!(
         view["edges"],
         json!([
-            {"from": "layer:adapters", "to": "layer:application", "links": 2, "guessed": 0, "against": false},
-            {"from": "layer:adapters", "to": "layer:domain", "links": 2, "guessed": 0, "against": false},
-            {"from": "layer:application", "to": "layer:adapters", "links": 1, "guessed": 1, "against": true},
-            {"from": "layer:application", "to": "layer:domain", "links": 2, "guessed": 0, "against": false},
-            {"from": "layer:domain", "to": "layer:adapters", "links": 1, "guessed": 0, "against": true},
+            {
+                "from": "layer:adapters",
+                "to": "layer:application",
+                "links": 2,
+                "guessed": 0,
+                "kinds": [{"kind": "calls", "links": 1}, {"kind": "implements", "links": 1}],
+                "against": false
+            },
+            {
+                "from": "layer:adapters",
+                "to": "layer:domain",
+                "links": 2,
+                "guessed": 0,
+                "kinds": [{"kind": "implements", "links": 1}, {"kind": "references", "links": 1}],
+                "against": false
+            },
+            {
+                "from": "layer:application",
+                "to": "layer:adapters",
+                "links": 1,
+                "guessed": 1,
+                "kinds": [{"kind": "calls", "links": 1}],
+                "against": true
+            },
+            {
+                "from": "layer:application",
+                "to": "layer:domain",
+                "links": 2,
+                "guessed": 0,
+                "kinds": [{"kind": "calls", "links": 1}, {"kind": "references", "links": 1}],
+                "against": false
+            },
+            {
+                "from": "layer:domain",
+                "to": "layer:adapters",
+                "links": 1,
+                "guessed": 0,
+                "kinds": [{"kind": "calls", "links": 1}],
+                "against": true
+            },
         ])
     );
     let against = &pattern["against"];
@@ -725,12 +760,54 @@ fn the_layers_of_a_folder_say_what_needs_what_and_what_runs_against_their_order(
     assert_eq!(
         view["edges"],
         json!([
-            {"from": "layer:entry", "to": "layer:services", "links": 3, "guessed": 0, "against": false},
-            {"from": "layer:services", "to": "layer:data", "links": 2, "guessed": 0, "against": false},
-            {"from": "layer:services", "to": "layer:model", "links": 3, "guessed": 0, "against": false},
-            {"from": "layer:data", "to": "layer:entry", "links": 1, "guessed": 1, "against": true},
-            {"from": "layer:data", "to": "layer:model", "links": 2, "guessed": 0, "against": false},
-            {"from": "layer:model", "to": "layer:services", "links": 2, "guessed": 0, "against": true},
+            {
+                "from": "layer:entry",
+                "to": "layer:services",
+                "links": 3,
+                "guessed": 0,
+                "kinds": [{"kind": "calls", "links": 2}, {"kind": "references", "links": 1}],
+                "against": false
+            },
+            {
+                "from": "layer:services",
+                "to": "layer:data",
+                "links": 2,
+                "guessed": 0,
+                "kinds": [{"kind": "calls", "links": 1}, {"kind": "references", "links": 1}],
+                "against": false
+            },
+            {
+                "from": "layer:services",
+                "to": "layer:model",
+                "links": 3,
+                "guessed": 0,
+                "kinds": [{"kind": "references", "links": 2}, {"kind": "calls", "links": 1}],
+                "against": false
+            },
+            {
+                "from": "layer:data",
+                "to": "layer:entry",
+                "links": 1,
+                "guessed": 1,
+                "kinds": [{"kind": "calls", "links": 1}],
+                "against": true
+            },
+            {
+                "from": "layer:data",
+                "to": "layer:model",
+                "links": 2,
+                "guessed": 0,
+                "kinds": [{"kind": "inherits", "links": 1}, {"kind": "references", "links": 1}],
+                "against": false
+            },
+            {
+                "from": "layer:model",
+                "to": "layer:services",
+                "links": 2,
+                "guessed": 0,
+                "kinds": [{"kind": "calls", "links": 1}, {"kind": "references", "links": 1}],
+                "against": true
+            },
         ])
     );
     // What runs against the order is listed pair by pair, the most linked
@@ -1294,7 +1371,14 @@ fn an_entity_called_after_a_plain_noun_is_no_layer_of_its_own() {
     assert_eq!(view["pattern"]["against"]["links"], 0);
     assert_eq!(
         view["edges"],
-        json!([{"from": "layer:entry", "to": "layer:model", "links": 1, "guessed": 0, "against": false}])
+        json!([{
+            "from": "layer:entry",
+            "to": "layer:model",
+            "links": 1,
+            "guessed": 0,
+            "kinds": [{"kind": "calls", "links": 1}],
+            "against": false
+        }])
     );
 }
 /// The shop as it was before a change, and as the change left it: the
@@ -1982,4 +2066,710 @@ fn many_files_and_many_pairs_are_listed_the_most_linked_first() {
     assert_eq!(forth["rows"][0]["from"]["name"], "Step00Service.php");
     assert_eq!(forth["rows"][0]["to"]["name"], "Thing00.php");
     assert_eq!(forth["rows"][1]["to"]["name"], "Thing01.php");
+}
+/// Declared layers file what the rules name, with the exceptions of the
+/// layers read from names: a test under a layer's path reaches into the
+/// layers it tests, and what is no code has no dependencies to check.
+#[test]
+fn declared_layers_leave_out_tests_and_what_is_no_code() {
+    const SERVICE: &str = "src/App/OrderService.php";
+    const ORDER: &str = "src/Domain/Order.php";
+    const TEST: &str = "src/Domain/OrderTest.php";
+    let mut graph = Graph::default();
+    for path in [SERVICE, ORDER, TEST, "src/Domain/README.md"] {
+        graph.file(path);
+    }
+    graph
+        .link(SERVICE, ORDER, "calls", None)
+        .link(TEST, SERVICE, "calls", None)
+        // Against the rules: the domain may use no other layer.
+        .link(ORDER, SERVICE, "references", Some("field"));
+    let index = graph.index();
+    let rules = Rules::parse(
+        json!({"version": 1, "layers": [
+            {"id": "app", "name": "App", "paths": ["src/App"], "allows": ["domain"]},
+            {"id": "domain", "name": "Domain", "paths": ["src/Domain"], "allows": []},
+        ]})
+        .to_string()
+        .as_bytes(),
+    )
+    .unwrap();
+    let view = index.declared_layers("shop", "", None, false, &rules);
+    let against = &view["pattern"]["against"];
+    assert_eq!(
+        (&against["links"], &against["pairs"]),
+        (&json!(1), &json!(1)),
+        "{view}"
+    );
+    assert_eq!(against["rows"][0]["from"]["path"], ORDER);
+    assert_eq!(view["pattern"]["apart"], 0, "{view}");
+    // The row of the found pattern counts the classified code alone.
+    let mut marked = json!({"scope": "", "nodes": []});
+    index.mark_declared_layers(&mut marked, Some(&rules));
+    assert_eq!(
+        marked["patterns"]["kinds"][0]["instances"][0]["parts"],
+        "Project rules · 2 classified files"
+    );
+    // So do the colors of the boxes and the links marked on the map.
+    let mut map = json!({
+        "scope": "src/Domain",
+        "nodes": [{"path": ORDER}, {"path": TEST}, {"path": "src/Domain/README.md"}],
+        "edges": [],
+    });
+    index.mark_architecture(&mut map, false, Some(&rules));
+    assert_eq!(map["nodes"][0]["architecture_layer"]["name"], "Domain");
+    assert!(map["nodes"][1]["architecture_layer"].is_null(), "{map}");
+    assert!(map["nodes"][2]["architecture_layer"].is_null(), "{map}");
+    assert_eq!(map["architecture"]["violations"]["pairs"], 1, "{map}");
+}
+#[test]
+fn layer_edges_aggregate_multi_kind_dependencies_sorted_by_count_then_name() {
+    let mut graph = Graph::default();
+    for path in [
+        "src/Controller/OrderController.php",
+        "src/Service/OrderService.php",
+        "src/Repository/OrderRepository.php",
+        "src/Entity/Order.php",
+    ] {
+        graph.file(path);
+    }
+    graph
+        .link(
+            "src/Controller/OrderController.php",
+            "src/Service/OrderService.php",
+            "calls",
+            None,
+        )
+        .link(
+            "src/Controller/OrderController.php",
+            "src/Service/OrderService.php",
+            "extends",
+            None,
+        )
+        .link(
+            "src/Controller/OrderController.php",
+            "src/Service/OrderService.php",
+            "implements",
+            None,
+        )
+        .link(
+            "src/Controller/OrderController.php",
+            "src/Service/OrderService.php",
+            "references",
+            Some("field"),
+        )
+        .guessed(
+            "src/Controller/OrderController.php",
+            "src/Service/OrderService.php",
+        )
+        .link(
+            "src/Service/OrderService.php",
+            "src/Repository/OrderRepository.php",
+            "calls",
+            None,
+        )
+        .link(
+            "src/Repository/OrderRepository.php",
+            "src/Entity/Order.php",
+            "references",
+            Some("return_type"),
+        );
+    let index = graph.index();
+    let all = index
+        .pattern("demo", "layers@src", &[], &|_| None, None, false)
+        .unwrap();
+    let entry_to_svc = all["edges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|edge| edge["from"] == "layer:entry" && edge["to"] == "layer:services")
+        .unwrap();
+    assert_eq!(
+        entry_to_svc,
+        &json!({
+            "from": "layer:entry",
+            "to": "layer:services",
+            "links": 5,
+            "guessed": 1,
+            "kinds": [
+                {"kind": "calls", "links": 2},
+                {"kind": "extends", "links": 1},
+                {"kind": "implements", "links": 1},
+                {"kind": "references", "links": 1},
+            ],
+            "against": false,
+        })
+    );
+    let certain = index
+        .pattern("demo", "layers@src", &[], &|_| None, None, true)
+        .unwrap();
+    let entry_to_svc_certain = certain["edges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|edge| edge["from"] == "layer:entry" && edge["to"] == "layer:services")
+        .unwrap();
+    assert_eq!(
+        entry_to_svc_certain["kinds"],
+        json!([
+            {"kind": "calls", "links": 1},
+            {"kind": "extends", "links": 1},
+            {"kind": "implements", "links": 1},
+            {"kind": "references", "links": 1},
+        ])
+    );
+}
+/// A picture leaves links out: a dense folder keeps the strongest of each
+/// box, and no picture draws more than its limit. A link against the rules
+/// is what the rules are asked for, so it is drawn all the same.
+#[test]
+fn a_link_against_the_order_is_drawn_whatever_the_limits_left_out() {
+    let index = shop().index();
+    let boxes = || {
+        json!({
+            "scope": "app",
+            "nodes": [
+                {"path": "app/Models", "folder": true},
+                {"path": "app/Services", "folder": true},
+                {"path": "app/Http", "folder": true},
+            ],
+            "edges": [
+                {"from": "app/Http", "to": "app/Services", "links": 3, "guessed": 0},
+            ],
+        })
+    };
+    let mut map = boxes();
+    index.mark_architecture(&mut map, false, None);
+    assert_eq!(map["architecture"]["kept"], 1, "{map}");
+    assert_eq!(
+        map["edges"],
+        json!([
+            {"from": "app/Http", "to": "app/Services", "links": 3, "guessed": 0},
+            {
+                "from": "app/Models", "to": "app/Services", "links": 2, "guessed": 0,
+                "kinds": [{"kind": "calls", "links": 1}, {"kind": "references", "links": 1}],
+                "kept": "violation", "architecture_violation": 2,
+            },
+        ]),
+        "{map}"
+    );
+    // A link the picture drew itself is marked where it stands, and none is
+    // added beside it.
+    let mut drawn = boxes();
+    drawn["edges"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"from": "app/Models", "to": "app/Services", "links": 2, "guessed": 0}));
+    index.mark_architecture(&mut drawn, false, None);
+    assert_eq!(drawn["architecture"]["kept"], 0, "{drawn}");
+    assert_eq!(drawn["edges"].as_array().unwrap().len(), 2);
+    assert_eq!(drawn["edges"][1]["architecture_violation"], 2);
+    assert!(drawn["edges"][1]["kept"].is_null());
+    // Two files of one box have no link to draw between them.
+    let mut one = json!({
+        "scope": "",
+        "nodes": [{"path": "app", "folder": true}],
+        "edges": [],
+    });
+    index.mark_architecture(&mut one, false, None);
+    assert_eq!(one["architecture"]["kept"], 0, "{one}");
+    assert_eq!(one["edges"], json!([]));
+    // What the tool only inferred is left out with the rest of its kind:
+    // data access calls an entry point by such a link.
+    let guessed = |certain| {
+        let mut map = json!({
+            "scope": "app",
+            "nodes": [{"path": REPOSITORY}, {"path": CONTROLLER}],
+            "edges": [],
+        });
+        index.mark_architecture(&mut map, certain, None);
+        map
+    };
+    let (all, certain) = (guessed(false), guessed(true));
+    assert_eq!(all["edges"][0]["architecture_violation"], 1, "{all}");
+    assert_eq!(all["edges"][0]["guessed"], 1);
+    assert_eq!(certain["edges"], json!([]), "{certain}");
+}
+/// No more of them are added than `KEPT_VIOLATIONS`: those of the most
+/// links first.
+#[test]
+fn the_links_kept_against_the_order_have_a_limit() {
+    let mut graph = Graph::default();
+    let (mut models, mut services) = (vec![], vec![]);
+    for at in 0..KEPT_VIOLATIONS + 3 {
+        models.push(format!("app/Models/Thing{at:02}.php"));
+        services.push(format!("app/Services/Step{at:02}Service.php"));
+    }
+    for path in models.iter().chain(&services) {
+        graph.file(path);
+    }
+    for (at, (model, service)) in models.iter().zip(&services).enumerate() {
+        graph
+            .link(service, model, "calls", None)
+            .link(model, service, "calls", None);
+        // The first pair holds one link more than any other.
+        if at == 0 {
+            graph.link(model, service, "references", Some("field"));
+        }
+    }
+    let index = graph.index();
+    let mut map = json!({
+        "scope": "app",
+        "nodes": models.iter().chain(&services).map(|path| json!({"path": path})).collect::<Vec<_>>(),
+        "edges": [],
+    });
+    index.mark_architecture(&mut map, false, None);
+    assert_eq!(map["architecture"]["kept"], KEPT_VIOLATIONS, "{map}");
+    assert_eq!(
+        map["architecture"]["violations"]["pairs"],
+        KEPT_VIOLATIONS + 3
+    );
+    let edges = map["edges"].as_array().unwrap();
+    assert_eq!(edges.len(), KEPT_VIOLATIONS);
+    assert_eq!(edges[0]["from"], models[0].as_str());
+    assert_eq!(edges[0]["architecture_violation"], 2);
+    assert_eq!(edges[1]["from"], models[1].as_str());
+}
+/// In an opened file the links are those of its symbols. One that leads
+/// from the file to a file of a layer it may not use is marked, by its own
+/// links; a link the order allows is not.
+#[test]
+fn an_opened_file_marks_its_links_against_the_order() {
+    let index = shop().index();
+    let order = format!("{ORDER}#L3:Order");
+    let mut map = json!({
+        "mode": "file",
+        "scope": ORDER,
+        "nodes": [
+            {"path": order, "symbol": true},
+            {"path": SERVICE, "role": "both"},
+            {"path": REPOSITORY, "role": "uses"},
+        ],
+        "edges": [
+            {"from": order, "to": SERVICE, "links": 2, "guessed": 0},
+            {"from": SERVICE, "to": order, "links": 1, "guessed": 0},
+            {"from": REPOSITORY, "to": order, "links": 1, "guessed": 0},
+        ],
+    });
+    index.mark_architecture(&mut map, false, None);
+    let marks = map["edges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|edge| edge["architecture_violation"].as_u64())
+        .collect::<Vec<_>>();
+    assert_eq!(marks, [Some(2), None, None], "{map}");
+    assert_eq!(map["architecture"]["kept"], 0);
+    assert_eq!(map["edges"].as_array().unwrap().len(), 3);
+    let rem = map["architecture"]["remediation"]
+        .as_array()
+        .expect("layer remediation hints");
+    assert_eq!(rem.len(), 1);
+    assert_eq!(rem[0]["weight"], 2);
+    assert!(rem[0]["hint"].as_str().unwrap().contains("port/interface"));
+}
+
+#[test]
+fn code_classifier_aligns_with_graph_ast_on_blade_templates() {
+    assert!(!code("resources/views/home.blade.php"));
+    assert!(code("app/Models/Order.php"));
+}
+
+#[test]
+fn skip_layer_remediation_hints_and_compare_declared_layers_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let rules = Rules::parse(
+        r#"{
+            "version": 1,
+            "layers": [
+                {"id": "api", "name": "API", "paths": ["src/api"], "allows": ["service", "repo"]},
+                {"id": "service", "name": "Service", "paths": ["src/service"], "allows": ["repo"]},
+                {"id": "repo", "name": "Repo", "paths": ["src/repo"], "allows": []}
+            ]
+        }"#
+        .as_bytes(),
+    )
+    .unwrap();
+
+    // Forward-index skip from `api` (0) -> `repo` (2) is emitted as `"skip_layer"`,
+    // while reverse `repo` (2) -> `api` (0) under declared rules is emitted as `"declared"`.
+    let base_g = json!({
+        "nodes": [
+            {"id": "api_h", "label": "Api.handle", "source_file": "src/api/Ctrl.php", "source_location": "L2"},
+            {"id": "svc_h", "label": "Svc.run", "source_file": "src/service/Svc.php", "source_location": "L2"},
+            {"id": "repo_h", "label": "Repo.find", "source_file": "src/repo/Repo.php", "source_location": "L2"}
+        ],
+        "links": [
+            {"source": "api_h", "target": "svc_h", "relation": "calls", "confidence": "EXTRACTED"},
+            {"source": "svc_h", "target": "repo_h", "relation": "calls", "confidence": "EXTRACTED"}
+        ]
+    });
+    let head_g = json!({
+        "nodes": [
+            {"id": "api_h", "label": "Api.handle", "source_file": "src/api/Ctrl.php", "source_location": "L2"},
+            {"id": "svc_h", "label": "Svc.run", "source_file": "src/service/Svc.php", "source_location": "L2"},
+            {"id": "repo_h", "label": "Repo.find", "source_file": "src/repo/Repo.php", "source_location": "L2"}
+        ],
+        "links": [
+            {"source": "repo_h", "target": "api_h", "relation": "calls", "confidence": "EXTRACTED"}
+        ]
+    });
+    let base_idx = Index::read(base_g.to_string().as_bytes(), dir.path()).unwrap();
+    let head_idx = Index::read(head_g.to_string().as_bytes(), dir.path()).unwrap();
+    let mut view = head_idx.declared_layers("demo", "", None, false, &rules);
+    head_idx.compare_declared_layers(&base_idx, &mut view, &HashMap::new(), false, &rules);
+    assert_eq!(view["pattern"]["change"]["state"], "ready");
+    assert_eq!(view["pattern"]["change"]["added"]["pairs"], 1);
+    let mut marked = head_idx.view("demo", "", None, false, "");
+    head_idx.mark_architecture(&mut marked, false, Some(&rules));
+    assert_eq!(
+        marked["architecture"]["remediation"][0]["rule_kind"],
+        "declared"
+    );
+
+    let hints = super::layer_remediation_hints(
+        [
+            (
+                true,
+                true,
+                "src/api/Ctrl.php",
+                "src/repo/Repo.php",
+                "API",
+                "Repo",
+                Flow {
+                    links: 2,
+                    guessed: 0,
+                },
+            ),
+            (
+                false,
+                false,
+                "src/repo/Repo.php",
+                "src/api/Ctrl.php",
+                "Repo",
+                "API",
+                Flow {
+                    links: 1,
+                    guessed: 0,
+                },
+            ),
+        ]
+        .into_iter(),
+    );
+    assert_eq!(hints[0]["rule_kind"], "backward");
+    assert_eq!(hints[1]["rule_kind"], "skip_layer");
+    assert!(
+        hints[1]["hint"]
+            .as_str()
+            .unwrap()
+            .contains("port/interface")
+    );
+}
+
+#[test]
+fn crate_and_folder_lod_preserve_extended_rules_and_violation_budget() {
+    use crate::graph_ir::{IrLinkSpec, IrNodeSpec};
+    let dir = tempfile::tempdir().unwrap();
+    for rel in [
+        "crates/app/Cargo.toml",
+        "packages/ui/Cargo.toml",
+        "packages/db/Cargo.toml",
+    ] {
+        let p = dir.path().join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, "[package]\nname=\"demo\"\n").unwrap();
+    }
+    let rules_json = serde_json::json!({
+        "version": 1,
+        "layers": [
+            {
+                "id": "ctrl",
+                "name": "Controllers",
+                "paths": ["crates/app/src/**"],
+                "forbids_semantic": ["writes_table"]
+            }
+        ],
+        "package_rules": [
+            {
+                "id": "pkg-ui",
+                "paths": ["packages/ui/**"],
+                "forbids": ["pkg-db"]
+            },
+            {
+                "id": "pkg-db",
+                "paths": ["packages/db/**"]
+            }
+        ],
+        "semantic_rules": [
+            {
+                "id": "sem-orders-only",
+                "from": "crates/app/src/**",
+                "relation": "writes_table",
+                "target": "table:orders",
+                "effect": "forbid"
+            }
+        ]
+    });
+    let rules = Rules::parse(rules_json.to_string().as_bytes()).expect("parse extended rules");
+
+    let mk_file = |path: &str| IrNodeSpec {
+        id: format!("file:{path}"),
+        label: path.rsplit('/').next().unwrap_or(path).to_owned(),
+        source_file: path.to_owned(),
+        source_location: None,
+        end_line: 0,
+        file_type: Some("code".into()),
+        node_kind: Some("page".into()),
+        community: None,
+        community_name: None,
+        callable_class: false,
+        is_abstract: false,
+        is_test: false,
+    };
+    let mk_fn = |id: &str, path: &str, name: &str| IrNodeSpec {
+        id: id.to_owned(),
+        label: format!("{name}()"),
+        source_file: path.to_owned(),
+        source_location: Some("L1".into()),
+        end_line: 1,
+        file_type: None,
+        node_kind: Some("function".into()),
+        community: None,
+        community_name: None,
+        callable_class: false,
+        is_abstract: false,
+        is_test: false,
+    };
+    let mk_sem = |id: &str, label: &str| IrNodeSpec {
+        id: id.to_owned(),
+        label: label.to_owned(),
+        source_file: "__semantic__/tables".into(),
+        source_location: Some("L2".into()),
+        end_line: 0,
+        file_type: None,
+        node_kind: Some("semantic".into()),
+        community: None,
+        community_name: None,
+        callable_class: false,
+        is_abstract: false,
+        is_test: false,
+    };
+    let mk_call = |src: &str, dst: &str, file: &str| IrLinkSpec {
+        source: src.into(),
+        target: dst.into(),
+        relation: Some("calls".into()),
+        confidence: Some("EXTRACTED".into()),
+        source_file: Some(file.into()),
+        context: None,
+        evidence: None,
+    };
+
+    let mut nodes = vec![
+        mk_file("crates/app/src/OrderCtrl.php"),
+        mk_fn("fn:ctrl", "crates/app/src/OrderCtrl.php", "store"),
+        mk_file("packages/ui/view.ts"),
+        mk_fn("fn:ui", "packages/ui/view.ts", "render"),
+        mk_file("packages/db/store.ts"),
+        mk_fn("fn:db", "packages/db/store.ts", "query"),
+        mk_sem("sem:table:orders", "table:orders"),
+        mk_sem("sem:table:orders_archive", "table:orders_archive"),
+    ];
+    let mut links = vec![
+        // Single call link (weight = 1), so 200 higher-weight clean edges outrank it past DRAWN=160.
+        mk_call("fn:ui", "fn:db", "packages/ui/view.ts"),
+        IrLinkSpec {
+            source: "fn:ctrl".into(),
+            target: "sem:table:orders".into(),
+            relation: Some("writes_table".into()),
+            confidence: Some("EXTRACTED".into()),
+            source_file: Some("crates/app/src/OrderCtrl.php".into()),
+            context: Some("writes_table".into()),
+            evidence: Some("DB::table('orders')".into()),
+        },
+        IrLinkSpec {
+            source: "fn:ctrl".into(),
+            target: "sem:table:orders_archive".into(),
+            relation: Some("reads_table".into()),
+            confidence: Some("EXTRACTED".into()),
+            source_file: Some("crates/app/src/OrderCtrl.php".into()),
+            context: Some("reads_table".into()),
+            evidence: Some("DB::table('orders_archive')".into()),
+        },
+    ];
+    // 22 clean crates * 9 outgoing crate-to-crate edges = 198 edges (> DRAWN = 160), while total
+    // bucket count (22 + 3 + 1 = 26) remains comfortably under SHOWN = 40 so all endpoints stay visible.
+    let clean_count = 22usize;
+    for i in 0..clean_count {
+        let cargo = dir.path().join(format!("crates/clean{i:02}/Cargo.toml"));
+        std::fs::create_dir_all(cargo.parent().unwrap()).unwrap();
+        std::fs::write(cargo, "[package]\nname=\"clean\"\n").unwrap();
+        let path = format!("crates/clean{i:02}/src/mod.ts");
+        let fn_id = format!("fn:c{i}");
+        nodes.push(mk_file(&path));
+        nodes.push(mk_fn(&fn_id, &path, "run"));
+    }
+    for i in 0..clean_count {
+        let src_path = format!("crates/clean{i:02}/src/mod.ts");
+        let src_fn = format!("fn:c{i}");
+        for off in 1..=9 {
+            let dst_fn = format!("fn:c{}", (i + off) % clean_count);
+            for _ in 0..3 {
+                links.push(mk_call(&src_fn, &dst_fn, &src_path));
+            }
+        }
+    }
+
+    let idx = Index::from_ir_parts(dir.path(), None, None, nodes, links).unwrap();
+    let filter = LodFilter {
+        scope: "",
+        focus: None,
+        filter: "",
+        certain: false,
+        offset: 0,
+        limit: None,
+    };
+
+    for lod in [Lod::Folder, Lod::Crate] {
+        let mut view = idx.view_at_lod_unfiltered("demo", lod, &filter);
+        idx.mark_architecture(&mut view, false, Some(&rules));
+        let edges = view["edges"].as_array().expect("edges array");
+        let pkg_edge = edges
+            .iter()
+            .find(|e| {
+                e["from"].as_str().unwrap_or("").starts_with("packages/ui")
+                    && e["to"].as_str().unwrap_or("").starts_with("packages/db")
+            })
+            .unwrap_or_else(|| {
+                panic!("expected preserved package violation at {lod:?}: {edges:?}")
+            });
+        assert!(
+            pkg_edge["architecture_violation"].as_u64().unwrap_or(0) >= 1,
+            "expected architecture_violation count on {lod:?} edge: {pkg_edge}"
+        );
+        assert!(
+            pkg_edge["rule_ids"]
+                .as_array()
+                .is_some_and(|arr| arr.iter().any(|v| v == "pkg-ui")),
+            "expected structured rule_ids on {lod:?} edge: {pkg_edge}"
+        );
+        assert!(
+            pkg_edge["architecture_rules"]
+                .as_array()
+                .is_some_and(|arr| arr.iter().any(|r| r["kind"] == "package")),
+            "expected structured architecture_rules on {lod:?} edge: {pkg_edge}"
+        );
+
+        let sem_orders_edge = edges.iter().find(|e| {
+            e["from"].as_str().unwrap_or("").starts_with("crates/app")
+                && e["to"] == "__semantic__/tables"
+                && e["architecture_rules"]
+                    .as_array()
+                    .is_some_and(|arr| arr.iter().any(|r| r["rule_id"] == "sem-orders-only"))
+        });
+        assert!(
+            sem_orders_edge.is_some(),
+            "expected preserved sem-orders-only edge at {lod:?}: {edges:?}"
+        );
+    }
+
+    // Also verify rollup_view_to_lod preserves structured rule_ids/architecture_rules, enforces
+    // exact semantic target matching, and preserves KEPT_VIOLATIONS past DRAWN=160.
+    let mut rollup_nodes = vec![
+        json!({"path": "packages/ui/view.ts", "name": "view.ts"}),
+        json!({"path": "packages/db/store.ts", "name": "store.ts"}),
+        json!({"path": "crates/app/src/OrderCtrl.php", "name": "OrderCtrl.php"}),
+        json!({"path": "sem:table:orders", "name": "table:orders", "node_kind": "semantic", "semantic": true}),
+        json!({"path": "sem:table:orders_archive", "name": "table:orders_archive", "node_kind": "semantic", "semantic": true}),
+    ];
+    let mut rollup_edges = vec![
+        json!({"from": "packages/ui/view.ts", "to": "packages/db/store.ts", "links": 1}),
+        json!({"from": "crates/app/src/OrderCtrl.php", "to": "sem:table:orders", "links": 1, "relation": "writes_table"}),
+        json!({"from": "crates/app/src/OrderCtrl.php", "to": "sem:table:orders_archive", "links": 2, "relation": "reads_table"}),
+    ];
+    for i in 0..clean_count {
+        rollup_nodes
+            .push(json!({"path": format!("crates/clean{i:02}/src/mod.ts"), "name": "mod.ts"}));
+    }
+    for i in 0..clean_count {
+        for off in 1..=9 {
+            rollup_edges.push(json!({
+                "from": format!("crates/clean{i:02}/src/mod.ts"),
+                "to": format!("crates/clean{:02}/src/mod.ts", (i + off) % clean_count),
+                "links": 5
+            }));
+        }
+    }
+    let mut marked_file_view = json!({"nodes": rollup_nodes, "edges": rollup_edges});
+    idx.mark_architecture(&mut marked_file_view, false, Some(&rules));
+    let archive_false_hit = marked_file_view["edges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|e| {
+            e["to"] == "sem:table:orders_archive"
+                && e["rule_ids"]
+                    .as_array()
+                    .is_some_and(|arr| arr.iter().any(|v| v == "sem-orders-only"))
+        });
+    assert!(
+        !archive_false_hit,
+        "target `table:orders` must not falsely match `table:orders_archive` via substring"
+    );
+    assert!(crate::graph_map::lod::rollup_view_to_lod(
+        &idx,
+        &mut marked_file_view,
+        Lod::Crate
+    ));
+    let rolled_edges = marked_file_view["edges"].as_array().unwrap();
+    let rolled_pkg = rolled_edges
+        .iter()
+        .find(|e| e["from"] == "packages/ui" && e["to"] == "packages/db")
+        .expect("rolled package violation preserved past DRAWN");
+    assert_eq!(rolled_pkg["kept"], "violation");
+    assert!(
+        rolled_pkg["rule_ids"]
+            .as_array()
+            .is_some_and(|arr| arr.iter().any(|v| v == "pkg-ui"))
+    );
+
+    // Also verify File-view mark_architecture restores truncated sem:* violations past DRAWN.
+    let mut truncated_file_edges: Vec<Value> = (0..crate::graph_map::DRAWN)
+        .map(|i| {
+            json!({
+                "from": format!("crates/clean{:02}/src/mod.ts", i % clean_count),
+                "to": format!("crates/clean{:02}/src/mod.ts", (i + 1) % clean_count),
+                "links": 5
+            })
+        })
+        .collect();
+    let file_nodes_with_sem: Vec<Value> = {
+        let mut v = vec![
+            json!({"path": "crates/app/src/OrderCtrl.php", "name": "OrderCtrl.php"}),
+            json!({"path": "sem:table:orders", "name": "table:orders", "node_kind": "semantic", "semantic": true}),
+        ];
+        for i in 0..clean_count {
+            v.push(json!({"path": format!("crates/clean{i:02}/src/mod.ts"), "name": "mod.ts"}));
+        }
+        v
+    };
+    let mut file_view_truncated = json!({
+        "nodes": file_nodes_with_sem,
+        "edges": std::mem::take(&mut truncated_file_edges)
+    });
+    idx.mark_architecture(&mut file_view_truncated, false, Some(&rules));
+    let restored_file_sem = file_view_truncated["edges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["from"] == "crates/app/src/OrderCtrl.php" && e["to"] == "sem:table:orders")
+        .expect(
+            "File-view truncated sem:table:orders violation must be restored in KEPT_VIOLATIONS",
+        );
+    assert_eq!(restored_file_sem["kept"], "violation");
+    assert_eq!(restored_file_sem["against"], true);
+    assert!(
+        restored_file_sem["rule_ids"]
+            .as_array()
+            .is_some_and(|arr| arr.iter().any(|v| v == "sem-orders-only"))
+    );
 }

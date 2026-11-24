@@ -1,6 +1,6 @@
 {
   "name": "graph-map",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Standalone interactive code-graph explorer for codebase dependencies, Git commits, pull requests, architectural layers, and AI coding run impact",
   "author": {
     "name": "Alex-Caepio",
@@ -13,7 +13,7 @@
   "interface": {
     "displayName": "Graph Map",
     "shortDescription": "Interactive project, commit, and current-work code graph explorer",
-    "longDescription": "Explore file, symbol, folder, layer, scenario, commit, pull-request, and Claude/Codex agent-run dependencies via CLI, 14 MCP tools, and an embedded localhost WASM UI.",
+    "longDescription": "Explore file, symbol, folder, layer, scenario, commit-range, pull-request, memory-link, and Claude/Codex agent-run dependencies via CLI, 16 MCP tools, and an embedded Canvas2D WASM UI.",
     "developerName": "Alex-Caepio",
     "category": "Coding",
     "capabilities": [

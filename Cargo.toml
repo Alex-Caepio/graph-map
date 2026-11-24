@@ -4,7 +4,7 @@ default-members = ["crates/graph-map-cli"]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.89"
 license = "Apache-2.0"
@@ -13,6 +13,17 @@ license = "Apache-2.0"
 lto = "thin"
 codegen-units = 1
 strip = "debuginfo"
+
+[profile.wasm-ui]
+inherits = "release"
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+
+[profile.test]
+debug = 0
 
 [profile.dev.package."*"]
 opt-level = 3

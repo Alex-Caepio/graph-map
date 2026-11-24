@@ -676,6 +676,24 @@ fn parse_harness_file(path: &Path, project_root: &Path, is_local: bool) -> Optio
         return None;
     }
 
+    Some(record_from_events(
+        session_id,
+        title,
+        provider,
+        status,
+        workspace,
+        &events,
+    ))
+}
+
+pub fn record_from_events(
+    session_id: String,
+    title: String,
+    provider: String,
+    status: String,
+    workspace: PathBuf,
+    events: &[Value],
+) -> RecordedRun {
     let mut launches_order = Vec::new();
     type LedgerEntry = (Option<String>, HarnessRunLedger, BTreeMap<String, u64>, BTreeMap<u64, Value>);
     let mut ledgers: BTreeMap<String, LedgerEntry> = BTreeMap::new();
@@ -718,14 +736,14 @@ fn parse_harness_file(path: &Path, project_root: &Path, is_local: bool) -> Optio
         })
         .collect();
 
-    Some(RecordedRun {
+    RecordedRun {
         session_id,
         title,
         provider,
         status,
         project_path: workspace,
         launches,
-    })
+    }
 }
 
 fn parse_claude_jsonl(path: &Path, project_root: &Path) -> Option<RecordedRun> {

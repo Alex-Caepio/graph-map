@@ -3,14 +3,17 @@ use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Arc, Mutex},
 };
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct StateStore {
     pub state: PathBuf,
-    lock: Mutex<()>,
-    active_runs: Mutex<BTreeMap<String, bool>>,
+    lock: Arc<Mutex<()>>,
+    active_runs: Arc<Mutex<BTreeMap<String, bool>>>,
+    sessions: Arc<Mutex<Vec<Value>>>,
+    session_events: Arc<Mutex<BTreeMap<String, Vec<Value>>>>,
+    next_event_id: Arc<std::sync::atomic::AtomicI64>,
 }
 
 impl StateStore {
@@ -20,8 +23,11 @@ impl StateStore {
         util::private_directory(&resolved.join("settings"))?;
         Ok(Self {
             state: resolved,
-            lock: Mutex::new(()),
-            active_runs: Mutex::new(BTreeMap::new()),
+            lock: Arc::new(Mutex::new(())),
+            active_runs: Arc::new(Mutex::new(BTreeMap::new())),
+            sessions: Arc::new(Mutex::new(Vec::new())),
+            session_events: Arc::new(Mutex::new(BTreeMap::new())),
+            next_event_id: Arc::new(std::sync::atomic::AtomicI64::new(1)),
         })
     }
 
@@ -187,12 +193,119 @@ impl StateStore {
         self.write_atomic(&path, serde_json::to_vec(value)?.as_slice())
     }
 
+    pub fn remove_setting(&self, name: &str) -> Result<()> {
+        let path = self.setting_path(name)?;
+        let _guard = self
+            .lock
+            .lock()
+            .map_err(|_| GraphError::unavailable("State store lock poisoned."))?;
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub fn create(&self, spec: &Value, title: &str, _attachments: &[Value]) -> Result<Value> {
+        let id = spec["id"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(util::unique_hex);
+        let status = spec["status"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("completed")
+            .to_owned();
+        let record = json!({
+            "id": id,
+            "title": if title.is_empty() { spec["title"].as_str().unwrap_or("") } else { title },
+            "project_id": spec["project_id"].as_str().unwrap_or(""),
+            "project_path": spec["project_path"].as_str().unwrap_or(""),
+            "provider": spec["provider"].as_str().unwrap_or("claude"),
+            "mode": spec["mode"].as_str().unwrap_or("edit"),
+            "status": status,
+            "created_at": util::now_rfc3339(),
+            "updated_at": util::now_rfc3339(),
+        });
+        if let Ok(mut list) = self.sessions.lock() {
+            list.retain(|item| item["id"] != record["id"]);
+            list.push(record.clone());
+        }
+        Ok(record)
+    }
+
+    pub fn get(&self, session: &str) -> Result<Value> {
+        let list = self
+            .sessions
+            .lock()
+            .map_err(|_| GraphError::unavailable("Session lock poisoned."))?;
+        list.iter()
+            .find(|item| item["id"] == session)
+            .cloned()
+            .ok_or_else(|| GraphError::missing("Session not found."))
+    }
+
+    pub fn event(&self, session: &str, payload: &Value) -> Result<i64> {
+        let _ = self.get(session)?;
+        let id = self
+            .next_event_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut stored = payload.clone();
+        if let Some(obj) = stored.as_object_mut() {
+            obj.entry("id").or_insert_with(|| json!(id));
+            obj.entry("at")
+                .or_insert_with(|| json!(util::now_rfc3339()));
+        }
+        if let Ok(mut map) = self.session_events.lock() {
+            map.entry(session.to_owned())
+                .or_default()
+                .push(stored);
+        }
+        Ok(id)
+    }
+
+    pub fn events(&self, session: &str, after: i64) -> Result<Vec<Value>> {
+        let map = self
+            .session_events
+            .lock()
+            .map_err(|_| GraphError::unavailable("Session event lock poisoned."))?;
+        Ok(map
+            .get(session)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter(|ev| ev["id"].as_i64().unwrap_or(0) > after)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    pub fn summaries(&self) -> Result<Vec<Value>> {
+        let list = self
+            .sessions
+            .lock()
+            .map_err(|_| GraphError::unavailable("Session lock poisoned."))?;
+        Ok(list.iter().rev().cloned().collect())
+    }
+
     pub fn has_active_runs(&self, project: &str) -> bool {
-        self.active_runs
+        let explicit = self
+            .active_runs
             .lock()
             .ok()
             .and_then(|map| map.get(project).copied())
-            .unwrap_or(false)
+            .unwrap_or(false);
+        if explicit {
+            return true;
+        }
+        self.sessions.lock().ok().is_some_and(|list| {
+            list.iter().any(|s| {
+                s["project_id"] == project
+                    && matches!(s["status"].as_str(), Some("queued" | "running"))
+            })
+        })
     }
 
     pub fn set_active_run(&self, project: &str, active: bool) {

@@ -45,8 +45,37 @@ pub enum Target {
     Named(String),
     /// One commit against its parent, as a history lists it.
     Commit(String),
+    /// A range comparison between two revisions (`range:<from>..<to>` or `range:<from>...<to>`).
+    Range {
+        from: String,
+        to: String,
+        three_dot: bool,
+    },
     /// What a run of an agent changed, as its session recorded it.
     Run(String),
+    /// What a multi-service system change run changed, as its execution evidence recorded it.
+    SysRun(String),
+}
+/// Validates a Git revision token used in `range:` targets and `base` range queries.
+pub(crate) fn is_valid_range_ref(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 200
+        && !name.starts_with('-')
+        && !name.starts_with('/')
+        && !name.ends_with('/')
+        && !name.contains("//")
+        && !name.starts_with('.')
+        && !name.ends_with('.')
+        && !name.ends_with(".lock")
+        && !name.contains("/.")
+        && !name.contains("..")
+        && !name.contains("@{")
+        && !name
+            .chars()
+            .any(|letter| letter.is_control() || letter.is_whitespace())
+        && !name
+            .chars()
+            .any(|letter| matches!(letter, ':' | '?' | '*' | '[' | '\\'))
 }
 impl Target {
     pub fn parse(text: &str) -> Result<Self> {
@@ -77,6 +106,23 @@ impl Target {
             .then(|| Self::Commit(hash.to_ascii_lowercase()))
             .ok_or_else(invalid);
         }
+        if let Some(spec) = text.strip_prefix("range:") {
+            let (from, to, three_dot) = if let Some((from, to)) = spec.split_once("...") {
+                (from, to, true)
+            } else if let Some((from, to)) = spec.split_once("..") {
+                (from, to, false)
+            } else {
+                return Err(invalid());
+            };
+            if !is_valid_range_ref(from) || !is_valid_range_ref(to) {
+                return Err(invalid());
+            }
+            return Ok(Self::Range {
+                from: from.to_owned(),
+                to: to.to_owned(),
+                three_dot,
+            });
+        }
         if let Some(session) = text.strip_prefix("run:") {
             return (!session.is_empty()
                 && session.len() <= 64
@@ -84,6 +130,18 @@ impl Target {
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'))
             .then(|| Self::Run(session.to_owned()))
+            .ok_or_else(invalid);
+        }
+        if let Some(run_id) = text
+            .strip_prefix("sysrun:")
+            .or_else(|| text.strip_prefix("system-run:"))
+        {
+            return (!run_id.is_empty()
+                && run_id.len() <= 64
+                && run_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'))
+            .then(|| Self::SysRun(run_id.to_owned()))
             .ok_or_else(invalid);
         }
         let name = text.strip_prefix("ref:").ok_or_else(invalid)?;
@@ -105,7 +163,16 @@ impl Target {
             Self::Pull(number) => format!("pr:{number}"),
             Self::Named(name) => format!("ref:{name}"),
             Self::Commit(hash) => format!("commit:{hash}"),
+            Self::Range {
+                from,
+                to,
+                three_dot,
+            } => {
+                let sep = if *three_dot { "..." } else { ".." };
+                format!("range:{from}{sep}{to}")
+            }
             Self::Run(session) => format!("run:{session}"),
+            Self::SysRun(run_id) => format!("sysrun:{run_id}"),
         }
     }
 }
@@ -472,6 +539,55 @@ fn named(root: &Path, prefix: String, name: &str, pulls: &[Pull]) -> Result<Reso
         notes: Vec::new(),
     })
 }
+/// Two arbitrary commits or refs compared directly (`from..to`) or from their merge base (`from...to`).
+fn range(root: &Path, prefix: String, from: &str, to: &str, three_dot: bool) -> Result<Resolved> {
+    let from_oid = commit(root, from)?.ok_or_else(|| {
+        GraphError::missing(format!("This checkout has no commit or ref {from}."))
+    })?;
+    let to_oid = commit(root, to)?.ok_or_else(|| {
+        GraphError::missing(format!("This checkout has no commit or ref {to}."))
+    })?;
+    let mut notes = Vec::new();
+    let base_oid = if three_dot {
+        match line(root, &["merge-base", &from_oid, &to_oid])? {
+            Some(mb) => mb,
+            None => {
+                notes.push(format!(
+                    "{to} shares no merge base with {from}, so direct comparison is shown."
+                ));
+                from_oid.clone()
+            }
+        }
+    } else {
+        from_oid.clone()
+    };
+    let files = diff(root, &base_oid, Some(&to_oid))?;
+    let sep = if three_dot { "..." } else { ".." };
+    let title = line(root, &["log", "-1", "--format=%s", &to_oid, "--"])?;
+    Ok(Resolved {
+        target: Target::Range {
+            from: from.to_owned(),
+            to: to.to_owned(),
+            three_dot,
+        },
+        kind: "range",
+        name: format!("{from}{sep}{to}"),
+        title,
+        pull: None,
+        files,
+        head: Some(Side {
+            name: to.to_owned(),
+            commit: to_oid.clone(),
+        }),
+        base: Some(Side {
+            name: from.to_owned(),
+            commit: base_oid,
+        }),
+        revision: Some(to_oid),
+        prefix,
+        notes,
+    })
+}
 /// One commit as a history shows it: what it changed against its parent,
 /// wherever it stands.
 fn single(root: &Path, prefix: String, hash: &str) -> Result<Resolved> {
@@ -649,7 +765,7 @@ fn said(errors: &str) -> String {
 /// Asks the GitHub CLI, which never prompts here. The error is its own first
 /// line, or that it is not installed.
 fn hub(root: &Path, arguments: &[&str]) -> std::result::Result<Value, String> {
-    let program = util::find_executable("gh")
+    let program = crate::util::find_executable("gh")
         .ok_or_else(|| "the GitHub CLI (gh) is not installed".to_owned())?;
     let mut command = Command::new(program);
     command
@@ -818,9 +934,14 @@ pub fn resolve(root: &Path, target: &Target, pulls: &[Pull]) -> Result<Resolved>
         Target::Uncommitted => work(root, prefix, pulls, false),
         Target::Named(name) => named(root, prefix, name, pulls),
         Target::Commit(hash) => single(root, prefix, hash),
+        Target::Range {
+            from,
+            to,
+            three_dot,
+        } => range(root, prefix, from, to, *three_dot),
         Target::Pull(number) => pull(root, prefix, *number),
         // Git knows nothing of a run: its session does.
-        Target::Run(_) => Err(GraphError::invalid(
+        Target::Run(_) | Target::SysRun(_) => Err(GraphError::invalid(
             "A run is read from its session, not from Git.",
         )),
     }
@@ -928,6 +1049,10 @@ fn logged(bytes: &[u8], remotes: &[&str]) -> Vec<Value> {
                 fields.next()?,
                 fields.next()?,
             );
+            let parents = parents
+                .split_whitespace()
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
             Some(json!({
                 "commit": commit,
                 "short": short,
@@ -935,7 +1060,8 @@ fn logged(bytes: &[u8], remotes: &[&str]) -> Vec<Value> {
                 "author": author,
                 "at": at.trim().parse::<i64>().ok(),
                 "refs": carried(names, remotes),
-                "merge": parents.split_whitespace().count() > 1,
+                "merge": parents.len() > 1,
+                "parents": parents,
             }))
         })
         .collect()
@@ -1071,11 +1197,19 @@ pub(crate) fn history(root: &Path, revision: &str) -> Result<History> {
 /// that begins a commit's hash puts that commit first. The flag says whether
 /// more follow.
 pub fn log(root: &Path, scope: &str, query: &str, skip: usize) -> Result<(Vec<Value>, bool)> {
-    checkout(root)?;
+    let prefix = checkout(root)?;
     let count = format!("--max-count={}", PAGE + 1);
     let skipped = format!("--skip={skip}");
     let wanted = format!("--grep={query}");
-    let mut arguments = vec!["log", "--no-color", "-z", LOGGED, &count, &skipped];
+    let mut arguments = vec![
+        "log",
+        "--no-color",
+        "--topo-order",
+        "-z",
+        LOGGED,
+        &count,
+        &skipped,
+    ];
     if !query.is_empty() {
         arguments.extend(["--fixed-strings", "--regexp-ignore-case", &wanted]);
     }
@@ -1095,6 +1229,9 @@ pub fn log(root: &Path, scope: &str, query: &str, skip: usize) -> Result<(Vec<Va
         }
     }
     arguments.push("--");
+    if !prefix.is_empty() {
+        arguments.push(".");
+    }
     let remotes = line(root, &["remote"])?.unwrap_or_default();
     let remotes = remotes
         .lines()
@@ -1111,16 +1248,34 @@ pub fn log(root: &Path, scope: &str, query: &str, skip: usize) -> Result<(Vec<Va
         && (4..=64).contains(&query.len())
         && query.bytes().all(|byte| byte.is_ascii_hexdigit())
         && let Some(found) = commit(root, query)?
-        && let Some(bytes) = raw(
-            root,
-            &["log", "--no-color", "-z", "-1", LOGGED, &found, "--"],
-            QUERY,
-        )?
     {
-        commits.retain(|row| row["commit"].as_str() != Some(found.as_str()));
-        commits.splice(0..0, logged(&bytes, &remotes));
+        let mut single_args = vec!["log", "--no-color", "-z", "-1", LOGGED, &found, "--"];
+        if !prefix.is_empty() {
+            single_args.push(".");
+        }
+        if let Some(bytes) = raw(root, &single_args, QUERY)? {
+            commits.retain(|row| row["commit"].as_str() != Some(found.as_str()));
+            commits.splice(0..0, logged(&bytes, &remotes));
+        }
     }
     Ok((commits, more))
+}
+/// Metadata for a single resolved commit (`commit`, `short`, `subject`,
+/// `author`, `at`, `refs`, `merge`, `parents`), independent of the checked-out
+/// branch or subproject prefix.
+pub(crate) fn commit_info(root: &Path, revision: &str) -> Result<Option<Value>> {
+    let remotes = line(root, &["remote"])?.unwrap_or_default();
+    let remotes = remotes
+        .lines()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .collect::<Vec<_>>();
+    let bytes = raw(
+        root,
+        &["log", "--no-color", "-z", "-1", LOGGED, revision, "--"],
+        QUERY,
+    )?;
+    Ok(bytes.and_then(|bytes| logged(&bytes, &remotes).into_iter().next()))
 }
 /// The branches for the picker: local ones, then the remote ones that no
 /// local branch of the same name stands at, each most recent first. `pulls`
@@ -1731,6 +1886,60 @@ mod tests {
         let (rest, more) = log(&repository.folder, "", "", PAGE).unwrap();
         assert_eq!((rest.len(), more), (3, false));
         assert_eq!(rest[2]["commit"], first);
+        assert_eq!(rest[2]["parents"], json!([]));
+    }
+    #[test]
+    fn log_returns_parents_and_topological_order_across_merged_branches() {
+        let repository = Repository::new();
+        let root_commit = repository.git(&["rev-parse", "HEAD"]);
+        repository.git(&["switch", "--quiet", "--create", "side"]);
+        repository.write("src/side.php", "<?php // side 1\n");
+        let side_one = repository.commit("Side one");
+        repository.git(&["switch", "--quiet", "main"]);
+        repository.write("src/main_a.php", "<?php // main 1\n");
+        let main_one = repository.commit("Main one");
+        repository.git(&["switch", "--quiet", "side"]);
+        repository.write("src/side.php", "<?php // side 2\n");
+        let side_two = repository.commit("Side two");
+        repository.git(&["switch", "--quiet", "main"]);
+        repository.git(&["merge", "--no-ff", "--quiet", "-m", "Merge side", "side"]);
+        let merged = repository.git(&["rev-parse", "HEAD"]);
+
+        let (commits, more) = log(&repository.folder, "*", "", 0).unwrap();
+        assert!(!more);
+        assert_eq!(commits.len(), 5);
+        assert_eq!(commits[0]["commit"], merged);
+        assert_eq!(commits[0]["merge"], true);
+        assert_eq!(commits[0]["parents"], json!([main_one, side_two]));
+
+        // Topological order guarantees every commit precedes its parents and
+        // avoids interleaving branch commits before their tips.
+        let pos = |hash: &str| {
+            commits
+                .iter()
+                .position(|c| c["commit"] == hash)
+                .expect("commit present")
+        };
+        assert!(pos(&merged) < pos(&main_one));
+        assert!(pos(&merged) < pos(&side_two));
+        assert!(pos(&side_two) < pos(&side_one));
+        assert!(pos(&main_one) < pos(&root_commit));
+        assert!(pos(&side_one) < pos(&root_commit));
+
+        let side_two_row = &commits[pos(&side_two)];
+        assert_eq!(side_two_row["merge"], false);
+        assert_eq!(side_two_row["parents"], json!([side_one]));
+        let root_row = &commits[pos(&root_commit)];
+        assert_eq!(root_row["parents"], json!([]));
+
+        // `commit_info` works from any subdir and returns the same metadata.
+        let info = commit_info(&repository.folder.join("src"), &side_two)
+            .unwrap()
+            .unwrap();
+        assert_eq!(info["commit"], side_two);
+        assert_eq!(info["subject"], "Side two");
+        assert_eq!(info["parents"], json!([side_one]));
+        assert_eq!(info["merge"], false);
     }
     #[test]
     fn branches_are_listed_local_first_and_a_remote_twin_is_left_out() {
@@ -1928,5 +2137,71 @@ mod tests {
             "<?php // not committed\n"
         );
         assert!(export(&repository.folder, "0000000", &into.with_file_name("none")).is_err());
+    }
+
+    #[test]
+    fn range_target_parses_strictly_and_resolves_two_and_three_dot_diffs() {
+        assert_eq!(
+            Target::parse("range:main..HEAD").unwrap(),
+            Target::Range {
+                from: "main".to_owned(),
+                to: "HEAD".to_owned(),
+                three_dot: false,
+            }
+        );
+        assert_eq!(
+            Target::parse("range:v1.0...feature/x").unwrap().text(),
+            "range:v1.0...feature/x"
+        );
+        for bad in [
+            "range:",
+            "range:..HEAD",
+            "range:main..",
+            "range:-bad..HEAD",
+            "range:main..-bad",
+            "range:a b..c",
+            "range:a@{0}..b",
+            "range:a..b..c",
+            "range:a\n..b",
+        ] {
+            assert!(
+                Target::parse(bad).is_err(),
+                "expected strict validation to reject {bad:?}"
+            );
+        }
+
+        let repo = Repository::new();
+        let base_c = repo.git(&["rev-parse", "HEAD"]);
+        repo.write("src/cart.php", "<?php // main edit\n");
+        repo.commit("main-step");
+        let main_c = repo.git(&["rev-parse", "HEAD"]);
+
+        repo.git(&["checkout", "--quiet", "-b", "feat", &base_c]);
+        repo.write("src/feat.php", "<?php // feat\n");
+        repo.commit("feat-step");
+        let feat_c = repo.git(&["rev-parse", "HEAD"]);
+        repo.git(&["checkout", "--quiet", "main"]);
+
+        let two_dot = resolve(
+            &repo.folder,
+            &Target::parse(&format!("range:{base_c}..{main_c}")).unwrap(),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(two_dot.kind, "range");
+        assert_eq!(two_dot.base.as_ref().unwrap().commit, base_c);
+        assert_eq!(two_dot.revision.as_deref(), Some(main_c.as_str()));
+        assert_eq!(paths(&two_dot), [('M', "src/cart.php")]);
+
+        // Three-dot compares merge-base(main, feat)..feat, excluding main's own edits.
+        let three_dot = resolve(
+            &repo.folder,
+            &Target::parse("range:main...feat").unwrap(),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(three_dot.base.as_ref().unwrap().commit, base_c);
+        assert_eq!(three_dot.revision.as_deref(), Some(feat_c.as_str()));
+        assert_eq!(paths(&three_dot), [('A', "src/feat.php")]);
     }
 }

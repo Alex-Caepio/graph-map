@@ -2,13 +2,24 @@ use crate::{GraphError, Result};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
-    ffi::OsStr,
-    io::Read,
-    path::{Path, PathBuf},
+    collections::BTreeMap,
+    ffi::{OsStr, OsString},
+    io::{Read, Write},
+    path::{Component, Path, PathBuf},
     process::{Command, Stdio},
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
 };
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PreparedCommand {
+    pub argv: Vec<String>,
+    pub environment: BTreeMap<String, String>,
+    pub input: Vec<u8>,
+    pub readable: Vec<PathBuf>,
+    pub remove: Vec<String>,
+    pub prompt_prefix: String,
+}
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -26,6 +37,10 @@ pub fn sha256(bytes: &[u8]) -> String {
         let _ = write!(&mut out, "{byte:02x}");
     }
     out
+}
+
+pub fn sha(bytes: &[u8]) -> String {
+    sha256(bytes)
 }
 
 pub fn now_rfc3339() -> String {
@@ -105,6 +120,10 @@ pub fn private_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
+pub fn canonicalize(path: &Path) -> std::io::Result<PathBuf> {
+    std::fs::canonicalize(path)
+}
+
 pub fn canonical_dir(path: &Path) -> Result<PathBuf> {
     let resolved = std::fs::canonicalize(path)?;
     if !resolved.is_dir() {
@@ -113,6 +132,137 @@ pub fn canonical_dir(path: &Path) -> Result<PathBuf> {
         ));
     }
     Ok(resolved)
+}
+
+fn absolute_lexical(path: &Path) -> Result<PathBuf> {
+    let input = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut out = PathBuf::new();
+    for part in input.components() {
+        match part {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            _ => out.push(part.as_os_str()),
+        }
+    }
+    Ok(out)
+}
+
+pub fn python_realpath(path: &Path) -> Result<PathBuf> {
+    let mut current = absolute_lexical(path)?;
+    let mut missing = Vec::new();
+    loop {
+        match std::fs::canonicalize(&current) {
+            Ok(mut base) => {
+                for item in missing.iter().rev() {
+                    base.push(item);
+                }
+                return Ok(base);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let name = current
+                    .file_name()
+                    .ok_or_else(|| GraphError::unavailable("Cannot resolve filesystem root."))?
+                    .to_os_string();
+                missing.push(name);
+                if !current.pop() {
+                    return Err(GraphError::unavailable("Cannot resolve filesystem root."));
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+fn is_linked(meta: &std::fs::Metadata) -> bool {
+    if meta.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if meta.file_attributes() & 0x400 != 0 {
+            return true;
+        }
+    }
+    false
+}
+
+pub fn admit_descendant(anchor: &Path, path: &Path) -> Result<()> {
+    let suffix = path
+        .strip_prefix(anchor)
+        .map_err(|_| GraphError::forbidden("Authority path escapes its anchor."))?;
+    let anchor_meta = std::fs::symlink_metadata(anchor)?;
+    if !anchor_meta.is_dir() || is_linked(&anchor_meta) {
+        return Err(GraphError::forbidden(
+            "Authority directory is linked or not a directory.",
+        ));
+    }
+    let mut current = anchor.to_path_buf();
+    for part in suffix.components() {
+        if !matches!(part, Component::Normal(_)) {
+            return Err(GraphError::forbidden("Invalid authority path component."));
+        }
+        current.push(part.as_os_str());
+        match std::fs::symlink_metadata(&current) {
+            Ok(meta) if is_linked(&meta) => {
+                return Err(GraphError::forbidden("Linked authority path is refused."));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+pub struct DirCustody {
+    root: PathBuf,
+    #[cfg(unix)]
+    id: (u64, u64),
+}
+
+impl DirCustody {
+    pub fn new(root: &Path) -> Result<Self> {
+        let abs = absolute_lexical(root)?;
+        let meta = std::fs::symlink_metadata(&abs)?;
+        if !meta.is_dir() || is_linked(&meta) {
+            return Err(GraphError::forbidden(
+                "Publication directory is linked or not a directory.",
+            ));
+        }
+        #[cfg(unix)]
+        let id = {
+            use std::os::unix::fs::MetadataExt;
+            (meta.dev(), meta.ino())
+        };
+        Ok(Self {
+            root: abs,
+            #[cfg(unix)]
+            id,
+        })
+    }
+
+    pub fn check(&self) -> Result<()> {
+        let meta = std::fs::symlink_metadata(&self.root)?;
+        if !meta.is_dir() || is_linked(&meta) {
+            return Err(GraphError::conflict("Publication root custody changed."));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if (meta.dev(), meta.ino()) != self.id {
+                return Err(GraphError::conflict("Publication root custody changed."));
+            }
+        }
+        Ok(())
+    }
 }
 
 pub fn find_executable(name: &str) -> Option<PathBuf> {
@@ -180,8 +330,23 @@ fn git_override(key: &OsStr) -> bool {
     }
 }
 
+pub fn strings(values: &[&str]) -> Vec<OsString> {
+    values.iter().map(OsString::from).collect()
+}
+
 pub fn git_run(root: &Path, args: &[String], seconds: u64) -> Result<GitOutput> {
-    if seconds == 0 {
+    let os_args: Vec<OsString> = args.iter().map(OsString::from).collect();
+    git_run_with_input(root, &os_args, None, Duration::from_secs(seconds), 16 * 1024 * 1024)
+}
+
+pub fn git_run_with_input(
+    root: &Path,
+    arguments: &[OsString],
+    input: Option<Vec<u8>>,
+    timeout: Duration,
+    output_limit: usize,
+) -> Result<GitOutput> {
+    if timeout.is_zero() {
         return Err(GraphError::unavailable("Git timeout must be positive."));
     }
     let mut command = Command::new("git");
@@ -193,8 +358,12 @@ pub fn git_run(root: &Path, args: &[String], seconds: u64) -> Result<GitOutput> 
         ))
         .args(["-c", "core.fsmonitor=false", "-C"])
         .arg(root)
-        .args(args)
-        .stdin(Stdio::null())
+        .args(arguments)
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
     for (key, _) in std::env::vars_os() {
@@ -212,10 +381,10 @@ pub fn git_run(root: &Path, args: &[String], seconds: u64) -> Result<GitOutput> 
         .stdout
         .take()
         .ok_or_else(|| GraphError::unavailable("Git stdout unavailable."))?;
+    let limit = output_limit.max(1024);
     let reader = std::thread::spawn(move || {
         let mut bytes = Vec::new();
         let mut chunk = [0u8; 8192];
-        let limit: usize = 16 * 1024 * 1024;
         while let Ok(read) = stdout.read(&mut chunk) {
             if read == 0 {
                 break;
@@ -225,7 +394,16 @@ pub fn git_run(root: &Path, args: &[String], seconds: u64) -> Result<GitOutput> 
         }
         bytes
     });
-    let deadline = Instant::now() + Duration::from_secs(seconds);
+    let writer = input.map(|bytes| {
+        let stdin = child.stdin.take();
+        std::thread::spawn(move || -> std::io::Result<()> {
+            if let Some(mut stdin) = stdin {
+                stdin.write_all(&bytes)?;
+            }
+            Ok(())
+        })
+    });
+    let deadline = Instant::now() + timeout;
     let code = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status.code().unwrap_or(1),
@@ -236,16 +414,25 @@ pub fn git_run(root: &Path, args: &[String], seconds: u64) -> Result<GitOutput> 
                 let _ = child.kill();
                 let _ = child.wait();
                 let _ = reader.join();
+                if let Some(w) = writer {
+                    let _ = w.join();
+                }
                 return Err(GraphError::unavailable("Git command timed out."));
             }
             Err(_) => {
                 let _ = child.kill();
                 let _ = child.wait();
                 let _ = reader.join();
+                if let Some(w) = writer {
+                    let _ = w.join();
+                }
                 return Err(GraphError::unavailable("Git command failed."));
             }
         }
     };
+    if let Some(w) = writer {
+        let _ = w.join();
+    }
     let stdout = reader
         .join()
         .map_err(|_| GraphError::unavailable("Git output reader panicked."))?;

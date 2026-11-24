@@ -68,3 +68,12 @@ impl From<serde_json::Error> for GraphError {
         Self::invalid(format!("Invalid JSON: {error}"))
     }
 }
+
+impl From<rusqlite::Error> for GraphError {
+    fn from(error: rusqlite::Error) -> Self {
+        match error {
+            rusqlite::Error::QueryReturnedNoRows => Self::missing("Record not found."),
+            _ => Self::unavailable(format!("SQLite error: {error}")),
+        }
+    }
+}

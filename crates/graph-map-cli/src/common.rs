@@ -1,5 +1,5 @@
 use graph_map_core::{
-    GraphError, Graphs, Result, StateStore,
+    GraphError, Graphs, MapQueryParams, Result, StateStore,
     graph_changes::Target,
     graph_map::Sharing,
     graphs::{Followed, Shown},
@@ -35,26 +35,55 @@ impl Engine {
         explicit_project: Option<&str>,
         session_default: Option<&Path>,
     ) -> Result<(String, PathBuf)> {
+        self.resolve_project_inner(explicit_project, session_default, false)
+    }
+
+    pub fn resolve_mcp_project(
+        &self,
+        explicit_project: Option<&str>,
+        session_default: Option<&Path>,
+    ) -> Result<(String, PathBuf)> {
+        self.resolve_project_inner(explicit_project, session_default, true)
+    }
+
+    fn resolve_project_inner(
+        &self,
+        explicit_project: Option<&str>,
+        session_default: Option<&Path>,
+        guard_plugin_cwd: bool,
+    ) -> Result<(String, PathBuf)> {
         let trimmed = explicit_project.map(str::trim).filter(|s| !s.is_empty());
-        let is_implicit_or_dot = matches!(trimmed, None | Some(".") | Some("./"));
+        let cwd = std::env::current_dir().ok();
+        let cwd_is_plugin = cwd.as_deref().is_some_and(looks_like_plugin_cache);
+        if guard_plugin_cwd {
+            if let Some(raw) = trimmed {
+                if cwd_is_plugin && Path::new(raw).is_relative() {
+                    return Err(GraphError::invalid(
+                        "Pass `project` (absolute repository directory path); the server process cwd is inside the plugin cache.",
+                    ));
+                }
+            } else {
+                let effective_default = session_default.or(cwd.as_deref());
+                if effective_default.is_some_and(looks_like_plugin_cache) {
+                    return Err(GraphError::invalid(
+                        "Pass `project` (repository directory path); the server process cwd is inside the plugin cache.",
+                    ));
+                }
+            }
+        }
         let candidate = match trimmed {
             Some(path) => PathBuf::from(path),
             None => match session_default {
                 Some(path) => path.to_path_buf(),
-                None => std::env::current_dir()?,
+                None => cwd.ok_or_else(|| {
+                    GraphError::invalid("Could not determine current working directory.")
+                })?,
             },
         };
-        if is_implicit_or_dot {
-            let check_dir = if trimmed.is_some() {
-                std::env::current_dir().unwrap_or_else(|_| candidate.clone())
-            } else {
-                candidate.clone()
-            };
-            if looks_like_plugin_cache(&check_dir) || looks_like_plugin_cache(&candidate) {
-                return Err(GraphError::invalid(
-                    "Pass `project` (repository directory path); the server process cwd is inside the plugin cache.",
-                ));
-            }
+        if guard_plugin_cwd && looks_like_plugin_cache(&candidate) {
+            return Err(GraphError::invalid(
+                "Pass `project` (repository directory path); target resolves inside a plugin directory.",
+            ));
         }
         if !candidate.is_dir() {
             return Err(GraphError::missing(format!(
@@ -82,14 +111,10 @@ impl Engine {
             None | Some(Target::Work | Target::Uncommitted | Target::Run(_))
         );
         if supports_fallback {
-            let live = self
-                .store
-                .state
-                .join("graphs")
-                .join(project)
-                .join("live")
-                .join("graph.json");
-            if !live.is_file() {
+            let home = self.store.state.join("graphs").join(project);
+            let live = home.join("live").join("graph.json");
+            let ir_db = home.join("graph_ir.sqlite3");
+            if !live.is_file() && !ir_db.is_file() {
                 for candidate in [
                     root.join("graphify-out").join("graph.json"),
                     root.join(".graph-map").join("graph.json"),
@@ -104,14 +129,10 @@ impl Engine {
     }
 
     pub fn ensure_graph_or_import(&self, project: &str, root: &Path) -> Result<Option<Value>> {
-        let live = self
-            .store
-            .state
-            .join("graphs")
-            .join(project)
-            .join("live")
-            .join("graph.json");
-        if live.is_file() {
+        let home = self.store.state.join("graphs").join(project);
+        let live = home.join("live").join("graph.json");
+        let ir_db = home.join("graph_ir.sqlite3");
+        if live.is_file() || ir_db.is_file() {
             return Ok(None);
         }
         for candidate in [
@@ -158,20 +179,122 @@ impl Engine {
     }
 }
 
-fn looks_like_plugin_cache(path: &Path) -> bool {
-    let s = path.to_string_lossy();
+fn has_plugin_markers(dir: &Path) -> bool {
+    let s = dir.to_string_lossy();
     s.contains("/.codex/plugins/cache/")
         || s.contains("\\.codex\\plugins\\cache\\")
         || s.contains("/.claude/plugins/cache/")
         || s.contains("\\.claude\\plugins\\cache\\")
-        || path.join(".codex-plugin").join("plugin.json").is_file()
-        || path.join(".claude-plugin").join("plugin.json").is_file()
+        || dir.join(".codex-plugin").join("plugin.json").is_file()
+        || dir.join(".claude-plugin").join("plugin.json").is_file()
+        || dir.join(".claude-plugin").join("marketplace.json").is_file()
+        || dir.join(".agents").join("plugins").join("marketplace.json").is_file()
+        || (dir.join(".mcp.json").is_file() && dir.join("bin").join("graph-map").is_file())
+}
+
+fn looks_like_plugin_cache(path: &Path) -> bool {
+    let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    for check in [path, resolved.as_path()] {
+        for anc in check.ancestors().take(4) {
+            if has_plugin_markers(anc) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 pub fn parse_target(text: Option<&str>) -> Result<Option<Target>> {
     match text.map(str::trim) {
         None | Some("") | Some("project") | Some("all") => Ok(None),
-        Some(raw) => Target::parse(raw).map(Some),
+        Some(raw) => {
+            let normalized = if let Some(rest) = raw.strip_prefix("pull:") {
+                format!("pr:{rest}")
+            } else if let Some(rest) = raw.strip_prefix("branch:") {
+                format!("ref:{rest}")
+            } else if !raw.contains(':') && raw.contains("..") {
+                format!("range:{raw}")
+            } else {
+                raw.to_owned()
+            };
+            Target::parse(&normalized).map(Some)
+        }
+    }
+}
+
+pub fn parse_target_or_range(
+    target: Option<&str>,
+    from: Option<&str>,
+    to: Option<&str>,
+) -> Result<Option<Target>> {
+    let t = target.map(str::trim).filter(|s| !s.is_empty());
+    let f = from.map(str::trim).filter(|s| !s.is_empty());
+    let to_ref = to.map(str::trim).filter(|s| !s.is_empty());
+    if t.is_some() && (f.is_some() || to_ref.is_some()) {
+        return Err(GraphError::invalid(
+            "Specify either `target` or `from`/`to` range parameters, not both.",
+        ));
+    }
+    if f.is_some() || to_ref.is_some() {
+        let (Some(from_ref), Some(to_ref)) = (f, to_ref) else {
+            return Err(GraphError::invalid(
+                "Both `from` and `to` are required for a range.",
+            ));
+        };
+        return Target::parse(&format!("range:{from_ref}..{to_ref}")).map(Some);
+    }
+    parse_target(t)
+}
+
+pub fn parse_map_params(
+    offset: Option<&str>,
+    limit: Option<&str>,
+    depth: Option<&str>,
+    lod: Option<&str>,
+    min_weight: Option<&str>,
+) -> Result<MapQueryParams> {
+    MapQueryParams::parse_with(offset, limit, depth, lod, min_weight)
+}
+
+pub fn build_or_import(
+    engine: &Engine,
+    project: &str,
+    root: &Path,
+    rebuild: bool,
+    wait: bool,
+) -> Result<Value> {
+    let current = engine.graphs.status(project, false)?;
+    let state = current["state"].as_str().unwrap_or("off");
+    if state == "ready" && !rebuild {
+        return Ok(current);
+    }
+    if state == "building" && !rebuild {
+        return if wait {
+            wait_settled(&engine.graphs, project, Duration::from_secs(120))
+        } else {
+            Ok(current)
+        };
+    }
+    let action = if current["enabled"] == true && (rebuild || state == "failed") {
+        "rebuild"
+    } else {
+        "enable"
+    };
+    match engine.graphs.act(project, action) {
+        Ok(status) => {
+            if wait && (status["build"].is_object() || status["state"] == "building") {
+                wait_settled(&engine.graphs, project, Duration::from_secs(120))
+            } else {
+                Ok(status)
+            }
+        }
+        Err(error) => {
+            if let Some(imported) = engine.ensure_graph_or_import(project, root)? {
+                Ok(imported)
+            } else {
+                Err(error)
+            }
+        }
     }
 }
 

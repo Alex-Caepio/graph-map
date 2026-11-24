@@ -1,25 +1,29 @@
-use crate::common::{Engine, build_sharing, render_explanation};
+use crate::common::{Engine, render_explanation};
 use axum::{
     Json, Router,
-    body::Body,
+    body::{Body, Bytes},
     extract::{Path as AxumPath, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use futures_util::stream;
 use graph_map_core::{
     GraphError,
     graph_changes::Target,
-    graphs::{Followed, Shown, places},
+    subscribe_graph_events,
     util,
 };
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
+    convert::Infallible,
     path::PathBuf,
     sync::Arc,
+    time::Duration,
 };
+use tokio::sync::broadcast::error::RecvError;
 
 const INDEX_HTML: &str = include_str!("../web/index.html");
 const APP_CSS: &str = include_str!("../web/app.css");
@@ -33,6 +37,7 @@ const CSP: &str = "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; sty
 pub const GRAPH_MAP_QUERY_PARAMS: &[&str] = &[
     "scope",
     "focus",
+    "focus_session",
     "certain",
     "filter",
     "target",
@@ -44,6 +49,8 @@ pub const GRAPH_MAP_QUERY_PARAMS: &[&str] = &[
     "from",
     "to",
     "path",
+    "longer",
+    "failing",
     "shared",
     "side",
     "skip",
@@ -56,7 +63,14 @@ pub const GRAPH_MAP_QUERY_PARAMS: &[&str] = &[
     "no_incoming",
     "launch",
     "compare_launch",
+    "agent",
     "scenario",
+    "whole",
+    "offset",
+    "limit",
+    "depth",
+    "lod",
+    "min_weight",
 ];
 
 #[derive(Clone)]
@@ -83,13 +97,18 @@ pub fn router(engine: Arc<Engine>, selected: Option<String>) -> Router {
         .route("/assets/graph_map_ui_bg.wasm", get(get_ui_wasm))
         .route("/api/health", get(get_health))
         .route("/api/bootstrap", get(get_bootstrap))
+        .route("/api/events/stream", get(get_events_stream))
         .route("/api/projects", post(post_projects))
         .route("/api/projects/{project_id}/graph", get(get_graph_status).post(post_graph_act))
         .route("/api/projects/{project_id}/graph/map", get(get_graph_map))
         .route("/api/projects/{project_id}/graph/find", get(get_graph_find))
+        .route("/api/projects/{project_id}/graph/changes", get(get_graph_changes))
+        .route("/api/projects/{project_id}/graph/file-impact", get(get_graph_file_impact))
         .route("/api/projects/{project_id}/graph/pulls", get(get_graph_pulls))
         .route("/api/projects/{project_id}/graph/commits", get(get_graph_commits))
         .route("/api/projects/{project_id}/graph/branches", get(get_graph_branches))
+        .route("/api/projects/{project_id}/graph/memory-links", get(get_graph_memory_links))
+        .route("/api/projects/{project_id}/graph/memory-links/batch", post(post_graph_memory_links_batch))
         .route("/api/projects/{project_id}/graph/runs", get(get_graph_runs))
         .route("/api/projects/{project_id}/graph/run-event", get(get_graph_run_event))
         .route("/api/projects/{project_id}/graph/explain", post(post_graph_explain))
@@ -132,10 +151,9 @@ async fn security_headers(req: axum::extract::Request, next: Next) -> Response {
         HeaderValue::from_static("nosniff"),
     );
     headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
-    headers.insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static("no-store"),
-    );
+    headers
+        .entry(header::CACHE_CONTROL)
+        .or_insert_with(|| HeaderValue::from_static("no-store"));
     res
 }
 
@@ -254,21 +272,140 @@ async fn post_projects(
     Ok(Json(state.engine.store.project(&id)?))
 }
 
+fn check_allowed_query(
+    query: &BTreeMap<String, String>,
+    allowed: &[&str],
+) -> std::result::Result<(), ApiError> {
+    let allowed_set: BTreeSet<&str> = allowed.iter().copied().collect();
+    if query.keys().any(|k| !allowed_set.contains(k.as_str())) {
+        return Err(ApiError(GraphError::invalid("Unexpected query parameter.")));
+    }
+    Ok(())
+}
+
+async fn execute_domain(
+    state: &AppState,
+    operation: &str,
+    project: &str,
+    query: &BTreeMap<String, String>,
+    body: Option<Value>,
+    include_fallback: bool,
+) -> std::result::Result<Json<Value>, ApiError> {
+    let mut request = json!({
+        "params": { "project_id": project },
+        "query": query,
+    });
+    if let Some(body) = body {
+        request["body"] = body;
+    }
+    if include_fallback {
+        let target = query
+            .get("target")
+            .map(String::as_str)
+            .filter(|s| !s.is_empty())
+            .map(Target::parse)
+            .transpose()?;
+        let record = state.engine.store.project(project)?;
+        let root = PathBuf::from(record["path"].as_str().unwrap_or(""));
+        if let Some(fallback) =
+            state
+                .engine
+                .fallback_graph_path(project, &root, target.as_ref(), None)?
+        {
+            request["_graph_override"] = json!(fallback.to_string_lossy());
+        }
+    }
+    Ok(Json(
+        state.engine.graphs.domain_execute(operation, request).await?,
+    ))
+}
+
+async fn get_events_stream(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<BTreeMap<String, String>>,
+) -> std::result::Result<Response, ApiError> {
+    check_allowed_query(&query, &["project_id", "last_event_id", "session_id"])?;
+    let raw_cursor = headers
+        .get("last-event-id")
+        .and_then(|v| v.to_str().ok())
+        .or_else(|| query.get("last_event_id").map(String::as_str))
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let start_seq = match raw_cursor {
+        None => 0u64,
+        Some(raw) => raw
+            .parse::<u64>()
+            .map_err(|_| GraphError::invalid("Invalid Last-Event-ID cursor."))?,
+    };
+    let filter_pid = query
+        .get("project_id")
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+    let expected_state = state.engine.store.state.clone();
+    let rx = subscribe_graph_events();
+
+    let event_stream = stream::unfold(
+        (rx, start_seq, expected_state, filter_pid),
+        |(mut rx, mut seq, expected_state, filter_pid)| async move {
+            loop {
+                match tokio::time::timeout(Duration::from_secs(15), rx.recv()).await {
+                    Ok(Ok(ev)) => {
+                        if ev.state_dir != expected_state {
+                            continue;
+                        }
+                        if filter_pid.as_deref().is_some_and(|pid| pid != ev.project_id) {
+                            continue;
+                        }
+                        seq = seq.saturating_add(1);
+                        let payload = serde_json::to_string(&ev).unwrap_or_else(|_| "{}".into());
+                        let frame = format!("id: {seq}\nevent: graph_status\ndata: {payload}\n\n");
+                        return Some((
+                            Ok::<Bytes, Infallible>(Bytes::from(frame)),
+                            (rx, seq, expected_state, filter_pid),
+                        ));
+                    }
+                    Ok(Err(RecvError::Lagged(skipped))) => {
+                        seq = seq.saturating_add(1);
+                        let payload = json!({
+                            "reason": "graph_bridge_lagged",
+                            "skipped": skipped,
+                        });
+                        let frame = format!("id: {seq}\nevent: resync\ndata: {payload}\n\n");
+                        return Some((
+                            Ok::<Bytes, Infallible>(Bytes::from(frame)),
+                            (rx, seq, expected_state, filter_pid),
+                        ));
+                    }
+                    Ok(Err(RecvError::Closed)) => return None,
+                    Err(_) => {
+                        return Some((
+                            Ok::<Bytes, Infallible>(Bytes::from_static(b": keepalive\n\n")),
+                            (rx, seq, expected_state, filter_pid),
+                        ));
+                    }
+                }
+            }
+        },
+    );
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream; charset=utf-8")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(Body::from_stream(event_stream))
+        .map_err(|_| ApiError(GraphError::unavailable("Could not start SSE stream.")))
+}
+
 async fn get_graph_status(
     State(state): State<AppState>,
     AxumPath(project): AxumPath<String>,
     Query(query): Query<BTreeMap<String, String>>,
 ) -> std::result::Result<Json<Value>, ApiError> {
-    let visit = match query.get("check").map(String::as_str) {
-        None | Some("0") => false,
-        Some("1") => true,
-        Some(_) => return Err(ApiError(GraphError::invalid("Invalid graph check."))),
-    };
-    let engine = state.engine.clone();
-    let val = tokio::task::spawn_blocking(move || engine.graphs.status(&project, visit))
-        .await
-        .map_err(|_| GraphError::unavailable("Status task aborted."))??;
-    Ok(Json(val))
+    check_allowed_query(&query, &["check"])?;
+    execute_domain(&state, "graph.status", &project, &query, None, false).await
 }
 
 async fn post_graph_act(
@@ -278,27 +415,15 @@ async fn post_graph_act(
     Json(body): Json<Value>,
 ) -> std::result::Result<Json<Value>, ApiError> {
     verify_csrf(&headers, &state)?;
-    if !util::exact(&body, &["action"], &["target"]) {
-        return Err(ApiError(GraphError::invalid("Invalid code graph action.")));
-    }
-    let engine = state.engine.clone();
-    match (body["action"].as_str().unwrap_or(""), body.get("target")) {
-        ("changes", Some(target)) => {
-            let target = Target::parse(target.as_str().unwrap_or(""))?;
-            let val = tokio::task::spawn_blocking(move || engine.graphs.choose(&project, &target))
-                .await
-                .map_err(|_| GraphError::unavailable("The change could not be read."))??;
-            Ok(Json(val))
-        }
-        (action, None) if action != "changes" => {
-            let action = action.to_owned();
-            let val = tokio::task::spawn_blocking(move || engine.graphs.act(&project, &action))
-                .await
-                .map_err(|_| GraphError::unavailable("Graph action aborted."))??;
-            Ok(Json(val))
-        }
-        _ => Err(ApiError(GraphError::invalid("Invalid code graph action."))),
-    }
+    execute_domain(
+        &state,
+        "graph.act",
+        &project,
+        &BTreeMap::new(),
+        Some(body),
+        false,
+    )
+    .await
 }
 
 async fn get_graph_pulls(
@@ -306,18 +431,8 @@ async fn get_graph_pulls(
     AxumPath(project): AxumPath<String>,
     Query(query): Query<BTreeMap<String, String>>,
 ) -> std::result::Result<Json<Value>, ApiError> {
-    let (state_q, wanted, _scope, _skip) = parse_history_query(&query)?;
-    let engine = state.engine.clone();
-    let val = tokio::task::spawn_blocking(move || {
-        if wanted.is_empty() && ["", "open"].contains(&state_q.as_str()) {
-            engine.graphs.pulls(&project)
-        } else {
-            engine.graphs.found(&project, &state_q, &wanted)
-        }
-    })
-    .await
-    .map_err(|_| GraphError::unavailable("Pulls query aborted."))??;
-    Ok(Json(val))
+    check_allowed_query(&query, &["state", "query"])?;
+    execute_domain(&state, "graph.pulls", &project, &query, None, false).await
 }
 
 async fn get_graph_commits(
@@ -325,22 +440,87 @@ async fn get_graph_commits(
     AxumPath(project): AxumPath<String>,
     Query(query): Query<BTreeMap<String, String>>,
 ) -> std::result::Result<Json<Value>, ApiError> {
-    let (_state_q, wanted, scope, skip) = parse_history_query(&query)?;
-    let engine = state.engine.clone();
-    let val = tokio::task::spawn_blocking(move || engine.graphs.commits(&project, &scope, &wanted, skip))
-        .await
-        .map_err(|_| GraphError::unavailable("Commits query aborted."))??;
-    Ok(Json(val))
+    check_allowed_query(&query, &["scope", "query", "skip"])?;
+    execute_domain(&state, "graph.commits", &project, &query, None, false).await
 }
 
 async fn get_graph_branches(
     State(state): State<AppState>,
     AxumPath(project): AxumPath<String>,
+    Query(query): Query<BTreeMap<String, String>>,
 ) -> std::result::Result<Json<Value>, ApiError> {
+    check_allowed_query(&query, &[])?;
+    execute_domain(&state, "graph.branches", &project, &query, None, false).await
+}
+
+async fn get_graph_find(
+    State(state): State<AppState>,
+    AxumPath(project): AxumPath<String>,
+    Query(query): Query<BTreeMap<String, String>>,
+) -> std::result::Result<Json<Value>, ApiError> {
+    check_allowed_query(&query, &["query", "target", "notests"])?;
+    execute_domain(&state, "graph.find", &project, &query, None, true).await
+}
+
+async fn get_graph_map(
+    State(state): State<AppState>,
+    AxumPath(project): AxumPath<String>,
+    Query(query): Query<BTreeMap<String, String>>,
+) -> std::result::Result<Json<Value>, ApiError> {
+    check_allowed_query(&query, GRAPH_MAP_QUERY_PARAMS)?;
+    execute_domain(&state, "graph.map", &project, &query, None, true).await
+}
+
+async fn get_graph_changes(
+    State(state): State<AppState>,
+    AxumPath(project): AxumPath<String>,
+    Query(query): Query<BTreeMap<String, String>>,
+) -> std::result::Result<Json<Value>, ApiError> {
+    check_allowed_query(
+        &query,
+        &["target", "from", "to", "focus_session", "agent", "notests"],
+    )?;
+    execute_domain(&state, "graph.changes", &project, &query, None, false).await
+}
+
+async fn get_graph_file_impact(
+    State(state): State<AppState>,
+    AxumPath(project): AxumPath<String>,
+    Query(query): Query<BTreeMap<String, String>>,
+) -> std::result::Result<Json<Value>, ApiError> {
+    check_allowed_query(
+        &query,
+        &["path", "target", "from", "to", "focus_session", "agent", "certain"],
+    )?;
+    execute_domain(&state, "graph.file_impact", &project, &query, None, false).await
+}
+
+async fn get_graph_memory_links(
+    State(state): State<AppState>,
+    AxumPath(project): AxumPath<String>,
+    Query(query): Query<BTreeMap<String, String>>,
+) -> std::result::Result<Json<Value>, ApiError> {
+    check_allowed_query(&query, &["path", "previous_path"])?;
     let engine = state.engine.clone();
-    let val = tokio::task::spawn_blocking(move || engine.graphs.branches(&project))
+    let query_json = json!(query);
+    let val = tokio::task::spawn_blocking(move || engine.graphs.memory_links(&project, &query_json))
         .await
-        .map_err(|_| GraphError::unavailable("Branches query aborted."))??;
+        .map_err(|_| GraphError::unavailable("Memory links task aborted."))??;
+    Ok(Json(val))
+}
+
+async fn post_graph_memory_links_batch(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(project): AxumPath<String>,
+    Json(body): Json<Value>,
+) -> std::result::Result<Json<Value>, ApiError> {
+    verify_csrf(&headers, &state)?;
+    let engine = state.engine.clone();
+    let val =
+        tokio::task::spawn_blocking(move || engine.graphs.memory_links_batch(&project, &body))
+            .await
+            .map_err(|_| GraphError::unavailable("Memory links batch task aborted."))??;
     Ok(Json(val))
 }
 
@@ -375,200 +555,6 @@ async fn get_graph_run_event(
     let val = tokio::task::spawn_blocking(move || engine.graphs.shell_event(&project, &session, event_id))
         .await
         .map_err(|_| GraphError::unavailable("Run event query aborted."))??;
-    Ok(Json(val))
-}
-
-async fn get_graph_find(
-    State(state): State<AppState>,
-    AxumPath(project): AxumPath<String>,
-    Query(query): Query<BTreeMap<String, String>>,
-) -> std::result::Result<Json<Value>, ApiError> {
-    let allowed: BTreeSet<&str> = ["query", "target", "notests"].into_iter().collect();
-    if query.keys().any(|k| !allowed.contains(k.as_str())) {
-        return Err(ApiError(GraphError::invalid("Unexpected query parameter.")));
-    }
-    let wanted = query.get("query").map(String::as_str).unwrap_or("");
-    if wanted.len() > 400 || wanted.chars().any(char::is_control) {
-        return Err(ApiError(GraphError::invalid("Invalid search.")));
-    }
-    let notests = match query.get("notests").map(String::as_str) {
-        None | Some("0") => false,
-        Some("1") => true,
-        Some(_) => return Err(ApiError(GraphError::invalid("Invalid graph filter."))),
-    };
-    let target = match query.get("target").map(String::as_str) {
-        None | Some("") => None,
-        Some(text) => Some(Target::parse(text)?),
-    };
-    let engine = state.engine.clone();
-    let wanted = wanted.to_owned();
-    let val = tokio::task::spawn_blocking(move || {
-        let record = engine.store.project(&project)?;
-        let root = PathBuf::from(record["path"].as_str().unwrap_or(""));
-        engine.run_find(&project, &root, target.as_ref(), &wanted, notests, None)
-    })
-    .await
-    .map_err(|_| GraphError::unavailable("The code graph could not be searched."))??;
-    Ok(Json(val))
-}
-
-async fn get_graph_map(
-    State(state): State<AppState>,
-    AxumPath(project): AxumPath<String>,
-    Query(query): Query<BTreeMap<String, String>>,
-) -> std::result::Result<Json<Value>, ApiError> {
-    let allowed: BTreeSet<&str> = GRAPH_MAP_QUERY_PARAMS.iter().copied().collect();
-    if query.keys().any(|k| !allowed.contains(k.as_str())) {
-        return Err(ApiError(GraphError::invalid("Unexpected query parameter.")));
-    }
-    let text = |name: &str| -> std::result::Result<String, GraphError> {
-        let val = query.get(name).map(String::as_str).unwrap_or("");
-        (val.len() <= 1024)
-            .then(|| val.to_owned())
-            .ok_or_else(|| GraphError::invalid("Invalid code graph place."))
-    };
-    let flag = |name: &str| -> std::result::Result<bool, GraphError> {
-        match query.get(name).map(String::as_str) {
-            None | Some("0") => Ok(false),
-            Some("1") => Ok(true),
-            Some(_) => Err(GraphError::invalid("Invalid graph filter.")),
-        }
-    };
-
-    let (scope, focus, filter) = (text("scope")?, text("focus")?, text("filter")?);
-    let (certain, notests) = (flag("certain")?, flag("notests")?);
-    let patterns = flag("patterns")?;
-    let history = flag("history")?;
-    let modules = flag("modules")?;
-    let no_incoming = flag("no_incoming")?;
-    let origin = text("scenario")?;
-    let launch = text("launch")?;
-    let compare_launch = text("compare_launch")?;
-    let target = match query.get("target").map(String::as_str) {
-        None | Some("") => None,
-        Some(raw) => Some(Target::parse(raw)?),
-    };
-    let followed = Followed::parse(
-        &text("follow")?,
-        query.get("out").map(String::as_str).unwrap_or(""),
-        query.get("into").map(String::as_str).unwrap_or(""),
-    )?;
-    let spread = places(
-        query.get("spread").map(String::as_str).unwrap_or(""),
-        "Too many folders are open here; close some first.",
-        "Invalid folders to open here.",
-    )?;
-    let (from, to) = (text("from")?, text("to")?);
-    if from.is_empty() != to.is_empty() {
-        return Err(ApiError(GraphError::invalid("Invalid code graph link.")));
-    }
-    let ends = places(
-        query.get("path").map(String::as_str).unwrap_or(""),
-        "Invalid code graph path.",
-        "Invalid code graph path.",
-    )?;
-    if !ends.is_empty() && ends.len() != 2 {
-        return Err(ApiError(GraphError::invalid("Invalid code graph path.")));
-    }
-    let sharing = places(
-        query.get("shared").map(String::as_str).unwrap_or(""),
-        "Invalid code graph places.",
-        "Invalid code graph places.",
-    )?;
-    if !sharing.is_empty() && (sharing.len() != 2 || !ends.is_empty()) {
-        return Err(ApiError(GraphError::invalid("Invalid code graph places.")));
-    }
-    let cycle = text("cycle")?;
-    let base = text("base")?;
-    if !base.is_empty()
-        && (!matches!(base.len(), 40 | 64) || !base.bytes().all(|b| b.is_ascii_hexdigit()))
-    {
-        return Err(ApiError(GraphError::invalid("Invalid pull request base.")));
-    }
-    if !cycle.is_empty()
-        && (cycle.chars().any(char::is_control)
-            || !from.is_empty()
-            || !ends.is_empty()
-            || !sharing.is_empty()
-            || followed.is_some())
-    {
-        return Err(ApiError(GraphError::invalid("Invalid code graph cycle.")));
-    }
-    let pattern = text("pattern")?;
-    if !pattern.is_empty()
-        && (pattern.chars().any(char::is_control)
-            || !from.is_empty()
-            || !ends.is_empty()
-            || !sharing.is_empty()
-            || !cycle.is_empty()
-            || followed.is_some())
-    {
-        return Err(ApiError(GraphError::invalid("Invalid code graph pattern.")));
-    }
-    if !origin.is_empty()
-        && (modules
-            || !base.is_empty()
-            || !from.is_empty()
-            || !ends.is_empty()
-            || !sharing.is_empty()
-            || !cycle.is_empty()
-            || !pattern.is_empty()
-            || followed.is_some())
-    {
-        return Err(ApiError(GraphError::invalid("Invalid scenario view.")));
-    }
-    let users = match query.get("side").map(String::as_str) {
-        None | Some("") => None,
-        Some("both_use") if !sharing.is_empty() => Some(false),
-        Some("uses_both") if !sharing.is_empty() => Some(true),
-        Some(_) => return Err(ApiError(GraphError::invalid("Invalid code graph places."))),
-    };
-    let skip = match query.get("skip").map(String::as_str) {
-        None | Some("") => 0,
-        Some(text) if !sharing.is_empty() || !origin.is_empty() => text
-            .parse::<usize>()
-            .ok()
-            .filter(|skip| *skip <= 1_000_000)
-            .ok_or_else(|| GraphError::invalid("Invalid code graph places."))?,
-        Some(_) => return Err(ApiError(GraphError::invalid("Invalid code graph places."))),
-    };
-
-    let engine = state.engine.clone();
-    let val = tokio::task::spawn_blocking(move || {
-        let record = engine.store.project(&project)?;
-        let root = PathBuf::from(record["path"].as_str().unwrap_or(""));
-        let shown = Shown {
-            scope: &scope,
-            focus: (!focus.is_empty()).then_some(focus.as_str()),
-            certain,
-            filter: &filter,
-            followed: followed.as_ref(),
-            notests,
-            spread: &spread,
-            link: (!from.is_empty()).then_some((from.as_str(), to.as_str())),
-            path: match ends.as_slice() {
-                [f, t] => Some((f.as_str(), t.as_str())),
-                _ => None,
-            },
-            cycle: (!cycle.is_empty()).then_some(cycle.as_str()),
-            base: (!base.is_empty()).then_some(base.as_str()),
-            shared: match sharing.as_slice() {
-                [f, t] => Some(build_sharing(f, t, users, skip)),
-                _ => None,
-            },
-            patterns,
-            history,
-            modules,
-            no_incoming,
-            launch: (!launch.is_empty()).then_some(launch.as_str()),
-            compare_launch: (!compare_launch.is_empty()).then_some(compare_launch.as_str()),
-            scenario: (!origin.is_empty()).then_some((origin.as_str(), skip)),
-            pattern: (!pattern.is_empty()).then_some(pattern.as_str()),
-        };
-        engine.run_map(&project, &root, target.as_ref(), &shown, None)
-    })
-    .await
-    .map_err(|_| GraphError::unavailable("The code graph map could not be read."))??;
     Ok(Json(val))
 }
 
@@ -629,33 +615,6 @@ async fn post_graph_explain(
     })))
 }
 
-fn parse_history_query(
-    query: &BTreeMap<String, String>,
-) -> std::result::Result<(String, String, String, usize), GraphError> {
-    let typed = |name: &str| {
-        let value = query.get(name).map(String::as_str).unwrap_or("");
-        (value.len() <= 200 && !value.chars().any(char::is_control))
-            .then(|| value.to_owned())
-            .ok_or_else(|| GraphError::invalid("Invalid search."))
-    };
-    let (state, wanted, scope) = (typed("state")?, typed("query")?, typed("scope")?);
-    if !["", "open", "closed", "merged", "all"].contains(&state.as_str())
-        || scope.starts_with('-')
-        || scope.chars().any(char::is_whitespace)
-    {
-        return Err(GraphError::invalid("Invalid search."));
-    }
-    let skip = match query.get("skip").map(String::as_str) {
-        None | Some("") => 0,
-        Some(text) => text
-            .parse::<usize>()
-            .ok()
-            .filter(|skip| *skip <= 1_000_000)
-            .ok_or_else(|| GraphError::invalid("Invalid search."))?,
-    };
-    Ok((state, wanted, scope, skip))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -665,6 +624,7 @@ mod tests {
         for part in [
             "scope",
             "focus",
+            "focus_session",
             "certain",
             "filter",
             "target",
@@ -676,6 +636,8 @@ mod tests {
             "from",
             "to",
             "path",
+            "longer",
+            "failing",
             "shared",
             "side",
             "skip",
@@ -688,7 +650,14 @@ mod tests {
             "no_incoming",
             "launch",
             "compare_launch",
+            "agent",
             "scenario",
+            "whole",
+            "offset",
+            "limit",
+            "depth",
+            "lod",
+            "min_weight",
         ] {
             assert!(GRAPH_MAP_QUERY_PARAMS.contains(&part), "{part}");
         }

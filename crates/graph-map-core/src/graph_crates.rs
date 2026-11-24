@@ -9,7 +9,7 @@
 //! that the link can be, so nothing true is left out of a map.
 use crate::graph_map::{SOURCE_LIMIT, quiet_end};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     path::Path,
     sync::LazyLock,
 };
@@ -21,7 +21,7 @@ pub const MODULES: &str = "modules";
 /// One dependency of a Cargo manifest: the key it stands under, the package
 /// where the key is another name for it, and whether the workspace says the
 /// rest.
-#[derive(Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 struct Needed {
     key: String,
     package: Option<String>,
@@ -29,7 +29,7 @@ struct Needed {
 }
 /// What a Cargo manifest says of a crate, as far as it tells which crates
 /// the crate can use and which sources it compiles.
-#[derive(Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 struct Manifest {
     /// The package it declares; none where it only holds a workspace.
     name: Option<String>,
@@ -271,6 +271,7 @@ fn led(folder: &str, written: &str) -> Option<String> {
     Some(parts.join("/"))
 }
 /// The Rust crates of a tree, and which of them each can use.
+#[derive(Clone, Debug, Default)]
 pub(crate) struct Crates {
     /// For each file of the graph, its crate: the package of the manifest
     /// that stands nearest above a Rust source; else `NONE`.
@@ -282,6 +283,10 @@ pub(crate) struct Crates {
     /// and build script are built with, and what those are built with.
     /// None where that is not known, and the crate may use any.
     can: Vec<Option<HashSet<u32>>>,
+    /// Manifest folders owning each crate id, plus workspace-only manifest folders.
+    folders: Vec<String>,
+    workspace_dirs: Vec<String>,
+    folder_manifests: Vec<Option<Manifest>>,
 }
 impl Crates {
     /// Finds the crates of the files of a graph, with `text` giving a file
@@ -435,7 +440,127 @@ impl Crates {
         } else {
             HashMap::new()
         };
-        Self { of, more, can }
+        let workspace_dirs = read
+            .iter()
+            .filter(|(_, found)| found.as_ref().is_some_and(|m| m.name.is_none()))
+            .map(|(dir, _)| (*dir).to_owned())
+            .collect();
+        let folder_manifests = manifests.into_iter().map(|m| m.cloned()).collect();
+        let folders = folders.into_iter().map(str::to_owned).collect();
+        Self {
+            of,
+            more,
+            can,
+            folders,
+            workspace_dirs,
+            folder_manifests,
+        }
+    }
+
+    /// Remaps `Crates` onto a filtered subset of files whose original file ids are `kept_to_old`.
+    pub(crate) fn remap(&self, kept_to_old: &[u32], old_len: usize) -> Self {
+        let mut old_to_new = vec![NONE; old_len];
+        let mut of = Vec::with_capacity(kept_to_old.len());
+        for (new_id, &old_id) in kept_to_old.iter().enumerate() {
+            old_to_new[old_id as usize] = new_id as u32;
+            of.push(self.of[old_id as usize]);
+        }
+        let mut more = HashMap::new();
+        for (&old_file, crates) in &self.more {
+            let new_file = old_to_new[old_file as usize];
+            if new_file != NONE {
+                more.insert(new_file, crates.clone());
+            }
+        }
+        Self {
+            of,
+            more,
+            can: self.can.clone(),
+            folders: self.folders.clone(),
+            workspace_dirs: self.workspace_dirs.clone(),
+            folder_manifests: self.folder_manifests.clone(),
+        }
+    }
+
+    /// Incrementally updates `Crates` after path edits/deletions without re-reading Cargo manifests
+    /// when `manifest_changed` is false, and without scanning Rust sources when no Rust files changed.
+    pub(crate) fn update_files(
+        &self,
+        prev_files: &[String],
+        new_files: &[String],
+        touched: &BTreeSet<String>,
+        manifest_changed: bool,
+        text: &dyn Fn(&str) -> Option<String>,
+    ) -> Self {
+        let rs_touched = touched
+            .iter()
+            .any(|p| p.ends_with(".rs") || p.ends_with(&format!(".{MODULES}")));
+        if manifest_changed
+            || (rs_touched && self.folders.is_empty() && self.workspace_dirs.is_empty())
+        {
+            return Self::find(new_files, text);
+        }
+        let prev_pos: HashMap<&str, u32> = prev_files
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (p.as_str(), i as u32))
+            .collect();
+        let folder_id: HashMap<&str, u32> = self
+            .folders
+            .iter()
+            .enumerate()
+            .map(|(i, f)| (f.as_str(), i as u32))
+            .collect();
+        let workspace_set: HashSet<&str> = self.workspace_dirs.iter().map(String::as_str).collect();
+        let mut old_to_new = vec![NONE; prev_files.len()];
+        let mut of = vec![NONE; new_files.len()];
+        for (new_idx, path) in new_files.iter().enumerate() {
+            if let Some(&old_idx) = prev_pos.get(path.as_str()) {
+                old_to_new[old_idx as usize] = new_idx as u32;
+                of[new_idx] = self.of[old_idx as usize];
+                continue;
+            }
+            if !path.ends_with(".rs") {
+                continue;
+            }
+            let mut folder = path.rsplit_once('/').map_or("", |(f, _)| f);
+            loop {
+                if let Some(&cid) = folder_id.get(folder) {
+                    of[new_idx] = cid;
+                    break;
+                }
+                if workspace_set.contains(folder) || folder.is_empty() {
+                    break;
+                }
+                folder = folder.rsplit_once('/').map_or("", |(above, _)| above);
+            }
+        }
+        let more = if self.folders.len() <= 1 {
+            HashMap::new()
+        } else if !rs_touched {
+            let mut remapped = HashMap::new();
+            for (&old_file, crates) in &self.more {
+                if let Some(&new_file) = old_to_new.get(old_file as usize)
+                    && new_file != NONE
+                {
+                    remapped.insert(new_file, crates.clone());
+                }
+            }
+            remapped
+        } else {
+            let folders_ref: Vec<&str> = self.folders.iter().map(String::as_str).collect();
+            let manifests_ref: Vec<Option<&Manifest>> =
+                self.folder_manifests.iter().map(Option::as_ref).collect();
+            Self::pulled(new_files, &of, &folders_ref, &manifests_ref, text)
+        };
+        Self {
+            of,
+            more,
+            can: self.can.clone(),
+            folders: self.folders.clone(),
+            workspace_dirs: self.workspace_dirs.clone(),
+            folder_manifests: self.folder_manifests.clone(),
+        }
     }
     /// The files a crate compiles from outside its own folder, each with the
     /// crates that pull it in. A source is pulled in by the `path` of a
@@ -570,6 +695,161 @@ impl Crates {
                     .as_ref()
                     .is_some_and(|can| all(to, used).all(|used| !can.contains(&used)))
             })
+    }
+
+    pub(crate) fn is_multi_crate(&self) -> bool {
+        self.folders.len() > 1
+    }
+
+    /// Returns `true` if Cargo crate boundaries permit `from_path` to depend on `to_path`.
+    #[allow(dead_code)]
+    pub(crate) fn allows_files(&self, files: &[String], from_path: &str, to_path: &str) -> bool {
+        let Some(from_id) = files.iter().position(|f| f == from_path) else {
+            return true;
+        };
+        let Some(to_id) = files.iter().position(|f| f == to_path) else {
+            return true;
+        };
+        !self.rules_out(from_id as u32, to_id as u32)
+    }
+}
+
+/// Workspace Cargo package metadata mapping crate identifiers to source roots and library entries.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct CratePackageInfo {
+    #[allow(dead_code)]
+    pub name: String,
+    #[allow(dead_code)]
+    pub ident: String,
+    #[allow(dead_code)]
+    pub folder: String,
+    pub src_dir: String,
+    pub lib_path: Option<String>,
+}
+
+/// Index of Cargo packages in a workspace for cross-crate `use pkg::...` module resolution.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct CratePackageMap {
+    by_ident: HashMap<String, Vec<CratePackageInfo>>,
+}
+
+impl CratePackageMap {
+    /// Builds a `CratePackageMap` from in-memory `(rel_path, content)` `Cargo.toml` manifests.
+    #[allow(dead_code)]
+    pub(crate) fn from_texts(manifests: &[(&str, &str)]) -> Self {
+        let mut out = Self::default();
+        for &(raw_path, text) in manifests {
+            let norm = raw_path.trim().replace('\\', "/");
+            let clean = norm.trim_start_matches("./");
+            let fname = clean.rsplit('/').next().unwrap_or(clean);
+            if fname != "Cargo.toml" {
+                continue;
+            }
+            let folder = clean
+                .rsplit_once('/')
+                .map_or_else(String::new, |(d, _)| d.to_owned());
+            out.ingest_manifest(&folder, text);
+        }
+        out
+    }
+
+    /// Builds a `CratePackageMap` from known workspace file paths and a file reader callback.
+    #[allow(dead_code)]
+    pub(crate) fn from_reader(files: &[String], reader: &dyn Fn(&str) -> Option<String>) -> Self {
+        let mut out = Self::default();
+        let mut seen_folders = HashSet::new();
+        for file in files {
+            let mut folder = file.rsplit_once('/').map_or("", |(d, _)| d);
+            loop {
+                if seen_folders.insert(folder.to_owned()) {
+                    let manifest_path = if folder.is_empty() {
+                        "Cargo.toml".to_owned()
+                    } else {
+                        format!("{folder}/Cargo.toml")
+                    };
+                    if let Some(text) = reader(&manifest_path) {
+                        out.ingest_manifest(folder, &text);
+                    }
+                }
+                if folder.is_empty() {
+                    break;
+                }
+                folder = folder.rsplit_once('/').map_or("", |(above, _)| above);
+            }
+        }
+        out
+    }
+
+    fn ingest_manifest(&mut self, folder: &str, text: &str) {
+        let parsed = manifest(text);
+        let Some(pkg_name) = parsed.name else {
+            return;
+        };
+        let lib_written = text
+            .parse::<toml::Table>()
+            .ok()
+            .and_then(|t| t.get("lib")?.get("path")?.as_str().map(str::to_owned));
+        let lib_path = lib_written
+            .as_deref()
+            .and_then(|p| led(folder, p))
+            .or_else(|| {
+                Some(if folder.is_empty() {
+                    "src/lib.rs".to_owned()
+                } else {
+                    format!("{folder}/src/lib.rs")
+                })
+            });
+        let src_dir = lib_path
+            .as_deref()
+            .and_then(|lp| lp.rsplit_once('/').map(|(d, _)| d.to_owned()))
+            .unwrap_or_else(|| {
+                if folder.is_empty() {
+                    "src".to_owned()
+                } else {
+                    format!("{folder}/src")
+                }
+            });
+        let ident = pkg_name.replace('-', "_");
+        self.by_ident
+            .entry(ident.clone())
+            .or_default()
+            .push(CratePackageInfo {
+                name: pkg_name,
+                ident,
+                folder: folder.to_owned(),
+                src_dir,
+                lib_path,
+            });
+    }
+
+    /// Resolves `crate_ident::segs_after_crate...` to `(target_file, consumed_segment_count)`.
+    pub(crate) fn resolve_crate_module(
+        &self,
+        crate_ident: &str,
+        segs_after_crate: &[&str],
+        known_files: &std::collections::BTreeSet<String>,
+    ) -> Option<(String, usize)> {
+        let norm_ident = crate_ident.replace('-', "_");
+        let entries = self.by_ident.get(&norm_ident)?;
+        for info in entries {
+            for k in (1..=segs_after_crate.len()).rev() {
+                let rel_mod = segs_after_crate[..k].join("/");
+                for cand in [
+                    format!("{}/{rel_mod}.rs", info.src_dir),
+                    format!("{}/{rel_mod}/mod.rs", info.src_dir),
+                ] {
+                    if let Some(found) = known_files.get(&cand) {
+                        return Some((found.clone(), 1 + k));
+                    }
+                }
+            }
+            if let Some(ref lp) = info.lib_path
+                && let Some(found) = known_files.get(lp)
+            {
+                return Some((found.clone(), 1));
+            }
+        }
+        None
     }
 }
 #[cfg(test)]
@@ -1048,5 +1328,49 @@ mod after_bytes;
         let bare = crates(&files, &manifests);
         assert!(!stands(&bare, "qa/src/check.rs", "core/src/fs/spelling.rs"));
         assert!(stands(&bare, "probe/src/lib.rs", "base/src/main.rs"));
+    }
+
+    #[test]
+    fn crate_package_map_resolves_custom_crate_names_and_lib_paths() {
+        let known: std::collections::BTreeSet<String> = [
+            "packages/auth-v2/custom_src/entry.rs",
+            "packages/auth-v2/custom_src/tokens.rs",
+            "apps/web/src/main.rs",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+
+        let map = CratePackageMap::from_texts(&[
+            (
+                "packages/auth-v2/Cargo.toml",
+                "[package]\nname = \"acme-auth\"\n[lib]\npath = \"custom_src/entry.rs\"\n",
+            ),
+            (
+                "apps/web/Cargo.toml",
+                "[package]\nname = \"web\"\n[dependencies]\nacme-auth = { path = \"../../packages/auth-v2\" }\n",
+            ),
+        ]);
+        assert_eq!(
+            map.resolve_crate_module("acme_auth", &["tokens", "verify"], &known),
+            Some(("packages/auth-v2/custom_src/tokens.rs".to_owned(), 2))
+        );
+        assert_eq!(
+            map.resolve_crate_module("acme_auth", &["AuthService"], &known),
+            Some(("packages/auth-v2/custom_src/entry.rs".to_owned(), 1))
+        );
+
+        let reader_files = vec!["packages/auth-v2/custom_src/tokens.rs".to_owned()];
+        let from_reader_map = CratePackageMap::from_reader(&reader_files, &|p| match p {
+            "packages/auth-v2/Cargo.toml" => Some(
+                "[package]\nname = \"acme-auth\"\n[lib]\npath = \"custom_src/entry.rs\"\n"
+                    .to_owned(),
+            ),
+            _ => None,
+        });
+        assert_eq!(
+            from_reader_map.resolve_crate_module("acme_auth", &["tokens"], &known),
+            Some(("packages/auth-v2/custom_src/tokens.rs".to_owned(), 2))
+        );
     }
 }

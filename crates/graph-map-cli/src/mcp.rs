@@ -1,14 +1,13 @@
 use crate::common::{
-    Engine, build_sharing, json_list_strings, parse_followed, parse_side, parse_target,
-    wait_settled,
+    Engine, build_or_import, build_sharing, json_list_strings, parse_followed, parse_map_params,
+    parse_side, parse_target, parse_target_or_range,
 };
-use graph_map_core::{GraphError, Result, graphs::Shown};
+use graph_map_core::{GraphError, MapQueryParams, Result, graphs::Shown};
 use serde_json::{Map, Value, json};
 use std::{
     io::{self, BufRead, Write},
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
 };
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -207,17 +206,55 @@ fn arg_usize(args: &Map<String, Value>, key: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+fn arg_num_str(args: &Map<String, Value>, key: &str) -> Option<String> {
+    match args.get(key) {
+        Some(Value::Number(n)) => Some(n.to_string()),
+        Some(Value::String(s)) if !s.trim().is_empty() => Some(s.trim().to_owned()),
+        _ => None,
+    }
+}
+
+fn arg_map_params(args: &Map<String, Value>) -> Result<MapQueryParams> {
+    let offset = arg_num_str(args, "offset");
+    let limit = arg_num_str(args, "limit");
+    let depth = arg_num_str(args, "depth");
+    let min_weight = arg_num_str(args, "min_weight");
+    let lod = arg_str(args, "lod");
+    parse_map_params(
+        offset.as_deref(),
+        limit.as_deref(),
+        depth.as_deref(),
+        lod,
+        min_weight.as_deref(),
+    )
+}
+
 fn dispatch_tool(
     engine: &Engine,
     default_root: Option<&Path>,
     name: &str,
     args: &Map<String, Value>,
 ) -> Result<Value> {
-    let (project, root) = engine.resolve_project(arg_str(args, "project"), default_root)?;
+    let (project, root) = engine.resolve_mcp_project(arg_str(args, "project"), default_root)?;
     let graph_override = arg_str(args, "graph").map(PathBuf::from);
-    let target = parse_target(arg_str(args, "target"))?;
     let certain = arg_bool(args, "certain", false);
     let notests = arg_bool(args, "notests", false);
+    let whole = arg_bool(args, "whole", false);
+    let no_incoming = arg_bool(args, "no_incoming", false);
+    let focus_session = arg_str(args, "focus_session");
+    let agent = arg_str(args, "agent");
+    let map_params = arg_map_params(args)?;
+    let parse_target_with_default = |default_target: Option<&str>| -> Result<Option<_>> {
+        if args.get("from").is_some() || args.get("to").is_some() {
+            parse_target_or_range(
+                arg_str(args, "target"),
+                arg_str(args, "from"),
+                arg_str(args, "to"),
+            )
+        } else {
+            parse_target(arg_str(args, "target").or(default_target))
+        }
+    };
 
     match name {
         "graph_status" => {
@@ -237,36 +274,12 @@ fn dispatch_tool(
             }
             let rebuild = arg_bool(args, "rebuild", false);
             let wait = arg_bool(args, "wait", true);
-            let current = engine.graphs.status(&project, false)?;
-            let action = if current["enabled"] == true {
-                if rebuild { "rebuild" } else { "enable" }
-            } else {
-                "enable"
-            };
-            if action == "enable" && current["enabled"] == true && !rebuild {
-                return Ok(current);
-            }
-            let started = engine.graphs.act(&project, action);
-            match started {
-                Ok(status) => {
-                    if wait && status["build"].is_object() {
-                        wait_settled(&engine.graphs, &project, Duration::from_secs(120))
-                    } else {
-                        Ok(status)
-                    }
-                }
-                Err(error) => {
-                    if let Some(imported) = engine.ensure_graph_or_import(&project, &root)? {
-                        Ok(imported)
-                    } else {
-                        Err(error)
-                    }
-                }
-            }
+            build_or_import(engine, &project, &root, rebuild, wait)
         }
         "graph_find" => {
             let query = arg_str(args, "query")
                 .ok_or_else(|| GraphError::invalid("Missing required `query` parameter."))?;
+            let target = parse_target(arg_str(args, "target"))?;
             engine.run_find(
                 &project,
                 &root,
@@ -279,6 +292,7 @@ fn dispatch_tool(
         "graph_neighbors" => {
             let node = arg_str(args, "node")
                 .ok_or_else(|| GraphError::invalid("Missing required `node` parameter."))?;
+            let target = parse_target_with_default(None)?;
             let scope = arg_str(args, "scope").unwrap_or("");
             let out_list = json_list_strings(args.get("out"));
             let into_list = json_list_strings(args.get("into"));
@@ -286,9 +300,18 @@ fn dispatch_tool(
             let shown = Shown {
                 scope,
                 focus: Some(node),
+                focus_session,
+                agent,
                 followed: followed.as_ref(),
                 certain,
                 notests,
+                no_incoming,
+                whole,
+                offset: map_params.offset,
+                limit: map_params.limit,
+                depth: map_params.depth,
+                lod: map_params.lod,
+                min_weight: map_params.min_weight,
                 ..Shown::default()
             };
             engine.run_map(
@@ -300,14 +323,18 @@ fn dispatch_tool(
             )
         }
         "graph_link" => {
+            let target = parse_target(arg_str(args, "target"))?;
             let from = arg_str(args, "from")
                 .ok_or_else(|| GraphError::invalid("Missing required `from` parameter."))?;
             let to = arg_str(args, "to")
                 .ok_or_else(|| GraphError::invalid("Missing required `to` parameter."))?;
             let shown = Shown {
                 link: Some((from, to)),
+                base: arg_str(args, "base"),
                 certain,
                 notests,
+                lod: map_params.lod,
+                min_weight: map_params.min_weight,
                 ..Shown::default()
             };
             engine.run_map(
@@ -319,14 +346,19 @@ fn dispatch_tool(
             )
         }
         "graph_path" => {
+            let target = parse_target(arg_str(args, "target"))?;
             let from = arg_str(args, "from")
                 .ok_or_else(|| GraphError::invalid("Missing required `from` parameter."))?;
             let to = arg_str(args, "to")
                 .ok_or_else(|| GraphError::invalid("Missing required `to` parameter."))?;
+            let longer = arg_usize(args, "longer", 0);
             let shown = Shown {
                 path: Some((from, to)),
+                longer,
                 certain,
                 notests,
+                lod: map_params.lod,
+                min_weight: map_params.min_weight,
                 ..Shown::default()
             };
             engine.run_map(
@@ -338,6 +370,7 @@ fn dispatch_tool(
             )
         }
         "graph_shared" => {
+            let target = parse_target(arg_str(args, "target"))?;
             let from = arg_str(args, "from")
                 .ok_or_else(|| GraphError::invalid("Missing required `from` parameter."))?;
             let to = arg_str(args, "to")
@@ -349,6 +382,10 @@ fn dispatch_tool(
                 shared: Some(sharing),
                 certain,
                 notests,
+                offset: map_params.offset,
+                limit: map_params.limit,
+                lod: map_params.lod,
+                min_weight: map_params.min_weight,
                 ..Shown::default()
             };
             engine.run_map(
@@ -360,6 +397,7 @@ fn dispatch_tool(
             )
         }
         "graph_cycle" => {
+            let target = parse_target(arg_str(args, "target"))?;
             let cycle = arg_str(args, "cycle")
                 .ok_or_else(|| GraphError::invalid("Missing required `cycle` parameter."))?;
             let scope = arg_str(args, "scope").unwrap_or("");
@@ -370,6 +408,8 @@ fn dispatch_tool(
                 base,
                 certain,
                 notests,
+                lod: map_params.lod,
+                min_weight: map_params.min_weight,
                 ..Shown::default()
             };
             engine.run_map(
@@ -381,16 +421,32 @@ fn dispatch_tool(
             )
         }
         "graph_change_impact" => {
-            let target = parse_target(Some(arg_str(args, "target").unwrap_or("work")))?;
+            let target = parse_target_with_default(Some("work"))?;
+            if arg_bool(args, "catalog_only", false) {
+                return engine.graphs.changes_catalog_with_agent(
+                    &project,
+                    target.as_ref(),
+                    focus_session,
+                    agent,
+                    notests,
+                );
+            }
             let scope = arg_str(args, "scope").unwrap_or("");
             let focus = arg_str(args, "focus");
             let base = arg_str(args, "base");
             let shown = Shown {
                 scope,
                 focus,
+                focus_session,
+                agent,
                 base,
                 certain,
                 notests,
+                whole,
+                offset: map_params.offset,
+                limit: map_params.limit,
+                lod: map_params.lod,
+                min_weight: map_params.min_weight,
                 ..Shown::default()
             };
             engine.run_map(
@@ -402,6 +458,7 @@ fn dispatch_tool(
             )
         }
         "graph_architecture" => {
+            let target = parse_target_with_default(None)?;
             let scope = arg_str(args, "scope").unwrap_or("");
             let pattern = arg_str(args, "pattern");
             let base = arg_str(args, "base");
@@ -411,9 +468,15 @@ fn dispatch_tool(
                 patterns: pattern.is_none() && !modules,
                 pattern,
                 modules,
+                no_incoming,
                 base,
                 certain,
                 notests,
+                whole,
+                offset: map_params.offset,
+                limit: map_params.limit,
+                lod: map_params.lod,
+                min_weight: map_params.min_weight,
                 ..Shown::default()
             };
             engine.run_map(
@@ -425,6 +488,7 @@ fn dispatch_tool(
             )
         }
         "graph_scenario" => {
+            let target = parse_target(arg_str(args, "target"))?;
             let entry = arg_str(args, "entry")
                 .ok_or_else(|| GraphError::invalid("Missing required `entry` parameter."))?;
             let skip = arg_usize(args, "skip", 0);
@@ -432,6 +496,8 @@ fn dispatch_tool(
                 scenario: Some((entry, skip)),
                 certain,
                 notests,
+                lod: map_params.lod,
+                min_weight: map_params.min_weight,
                 ..Shown::default()
             };
             engine.run_map(
@@ -443,7 +509,7 @@ fn dispatch_tool(
             )
         }
         "graph_test_reach" => {
-            let target = parse_target(Some(arg_str(args, "target").unwrap_or("work")))?;
+            let target = parse_target_with_default(Some("work"))?;
             let shown = Shown {
                 certain,
                 notests: false,
@@ -465,6 +531,7 @@ fn dispatch_tool(
             }))
         }
         "graph_history_hotspots" => {
+            let target = parse_target(arg_str(args, "target"))?;
             let scope = arg_str(args, "scope").unwrap_or("");
             let branch = arg_str(args, "branch").unwrap_or("");
             let query = arg_str(args, "query").unwrap_or("");
@@ -474,6 +541,8 @@ fn dispatch_tool(
                 history: true,
                 certain,
                 notests,
+                lod: map_params.lod,
+                min_weight: map_params.min_weight,
                 ..Shown::default()
             };
             let view = engine.run_map(
@@ -501,6 +570,8 @@ fn dispatch_tool(
                 compare_launch,
                 certain,
                 notests,
+                lod: map_params.lod,
+                min_weight: map_params.min_weight,
                 ..Shown::default()
             };
             engine.run_map(
@@ -510,6 +581,43 @@ fn dispatch_tool(
                 &shown,
                 graph_override.as_deref(),
             )
+        }
+        "graph_file_impact" => {
+            let path = arg_str(args, "path")
+                .ok_or_else(|| GraphError::invalid("Missing required `path` parameter."))?;
+            let target = parse_target_with_default(Some("work"))?;
+            engine.graphs.file_impact_with_agent(
+                &project,
+                path,
+                target.as_ref(),
+                focus_session,
+                agent,
+                certain,
+            )
+        }
+        "graph_memory_links" => {
+            if let Some(files) = args.get("files") {
+                let raw = files
+                    .as_array()
+                    .ok_or_else(|| GraphError::invalid("`files` must be a JSON array."))?;
+                let normalized: Vec<Value> = raw
+                    .iter()
+                    .map(|item| match item {
+                        Value::String(s) => json!({ "path": s }),
+                        other => other.clone(),
+                    })
+                    .collect();
+                return engine
+                    .graphs
+                    .memory_links_batch(&project, &json!({ "files": normalized }));
+            }
+            let path = arg_str(args, "path")
+                .ok_or_else(|| GraphError::invalid("Missing `path` or `files` parameter."))?;
+            let mut query = json!({ "path": path });
+            if let Some(prev) = arg_str(args, "previous_path") {
+                query["previous_path"] = json!(prev);
+            }
+            engine.graphs.memory_links(&project, &query)
         }
         unknown => Err(GraphError::missing(format!("Unknown MCP tool: {unknown}"))),
     }
@@ -555,14 +663,28 @@ pub fn tool_definitions() -> Vec<Value> {
     let target_prop = || {
         json!({
             "type": "string",
-            "description": "Optional target: 'work', 'uncommitted', 'commit:<sha>', 'branch:<name>', 'pull:<num>', or 'run:<session-id>'."
+            "description": "Optional target: 'work', 'uncommitted', 'commit:<sha>', 'ref:<name>', 'pr:<num>', 'range:<from>..<to>' (or '<from>..<to>'), or 'run:<session-id>'."
+        })
+    };
+    let lod_prop = || {
+        json!({
+            "type": "string",
+            "enum": ["overview", "folder", "file", "symbol"],
+            "description": "Progressive level-of-detail slice."
+        })
+    };
+    let min_weight_prop = || {
+        json!({
+            "type": "integer",
+            "minimum": 1,
+            "description": "Minimum edge link weight threshold to retain."
         })
     };
 
     vec![
         tool_def(
             "graph_status",
-            "Check code graph availability, node/edge counts, staleness, and active build progress for a project.",
+            "Check code graph availability, node/edge counts, backend, staleness, and active build progress for a project.",
             true,
             json!({
                 "project": project_prop(),
@@ -573,7 +695,7 @@ pub fn tool_definitions() -> Vec<Value> {
         ),
         tool_def(
             "graph_build",
-            "Enable, build, rebuild, or import a node-link code graph for a project.",
+            "Enable, build (native 13-language tree-sitter AST + SQLite IR by default, or graphify), rebuild, or import a node-link code graph.",
             false,
             json!({
                 "project": project_prop(),
@@ -598,7 +720,7 @@ pub fn tool_definitions() -> Vec<Value> {
         ),
         tool_def(
             "graph_neighbors",
-            "Inspect what a folder, file, or symbol uses and what depends on it, unfolding step by step.",
+            "Inspect what a folder, file, or symbol uses and what depends on it, unfolding step by step with optional depth and LOD.",
             true,
             json!({
                 "project": project_prop(),
@@ -606,7 +728,18 @@ pub fn tool_definitions() -> Vec<Value> {
                 "scope": { "type": "string", "description": "Optional folder scope." },
                 "out": { "type": "array", "items": { "type": "string" }, "description": "Places unfolded along outgoing uses." },
                 "into": { "type": "array", "items": { "type": "string" }, "description": "Places unfolded along incoming dependents." },
+                "depth": { "type": "integer", "minimum": 1, "maximum": 6, "description": "Neighborhood hop depth (1..6)." },
+                "no_incoming": { "type": "boolean", "description": "Highlight nodes with no incoming dependents." },
                 "target": target_prop(),
+                "from": { "type": "string", "description": "Range start commit/branch/tag (used with 'to')." },
+                "to": { "type": "string", "description": "Range end commit/branch/tag (used with 'from')." },
+                "focus_session": { "type": "string" },
+                "agent": { "type": "string" },
+                "lod": lod_prop(),
+                "min_weight": min_weight_prop(),
+                "whole": { "type": "boolean" },
+                "offset": { "type": "integer", "minimum": 0 },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 500 },
                 "certain": { "type": "boolean" },
                 "notests": { "type": "boolean" },
                 "graph": graph_prop()
@@ -622,6 +755,9 @@ pub fn tool_definitions() -> Vec<Value> {
                 "from": { "type": "string" },
                 "to": { "type": "string" },
                 "target": target_prop(),
+                "base": { "type": "string" },
+                "lod": lod_prop(),
+                "min_weight": min_weight_prop(),
                 "certain": { "type": "boolean" },
                 "notests": { "type": "boolean" },
                 "graph": graph_prop()
@@ -630,13 +766,16 @@ pub fn tool_definitions() -> Vec<Value> {
         ),
         tool_def(
             "graph_path",
-            "Find the shortest directed dependency path between two files or folders.",
+            "Find the shortest directed dependency paths between two files or folders.",
             true,
             json!({
                 "project": project_prop(),
                 "from": { "type": "string" },
                 "to": { "type": "string" },
+                "longer": { "type": "integer", "minimum": 0, "description": "Include near-shortest paths up to N extra hops." },
                 "target": target_prop(),
+                "lod": lod_prop(),
+                "min_weight": min_weight_prop(),
                 "certain": { "type": "boolean" },
                 "notests": { "type": "boolean" },
                 "graph": graph_prop()
@@ -653,6 +792,10 @@ pub fn tool_definitions() -> Vec<Value> {
                 "to": { "type": "string" },
                 "side": { "type": "string", "enum": ["both_use", "uses_both"] },
                 "skip": { "type": "integer", "minimum": 0 },
+                "offset": { "type": "integer", "minimum": 0 },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 500 },
+                "lod": lod_prop(),
+                "min_weight": min_weight_prop(),
                 "target": target_prop(),
                 "certain": { "type": "boolean" },
                 "notests": { "type": "boolean" },
@@ -670,6 +813,8 @@ pub fn tool_definitions() -> Vec<Value> {
                 "scope": { "type": "string" },
                 "target": target_prop(),
                 "base": { "type": "string" },
+                "lod": lod_prop(),
+                "min_weight": min_weight_prop(),
                 "certain": { "type": "boolean" },
                 "notests": { "type": "boolean" },
                 "graph": graph_prop()
@@ -678,14 +823,24 @@ pub fn tool_definitions() -> Vec<Value> {
         ),
         tool_def(
             "graph_change_impact",
-            "Map uncommitted changes, current branch work, commit diffs, pull requests, or agent runs against the code graph.",
+            "Map uncommitted changes, current branch work, commit diffs, commit ranges, pull requests, or agent runs against the code graph.",
             true,
             json!({
                 "project": project_prop(),
                 "target": target_prop(),
+                "from": { "type": "string", "description": "Range start commit/branch/tag (used with 'to')." },
+                "to": { "type": "string", "description": "Range end commit/branch/tag (used with 'from')." },
                 "scope": { "type": "string" },
                 "focus": { "type": "string" },
+                "focus_session": { "type": "string", "description": "Optional live agent session ID to overlay prompt/edited targets." },
+                "agent": { "type": "string", "description": "Optional agent filter." },
                 "base": { "type": "string" },
+                "catalog_only": { "type": "boolean", "description": "Return compact changed-files catalog and symbol diffs without full map layout." },
+                "lod": lod_prop(),
+                "min_weight": min_weight_prop(),
+                "whole": { "type": "boolean" },
+                "offset": { "type": "integer", "minimum": 0 },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 500 },
                 "certain": { "type": "boolean" },
                 "notests": { "type": "boolean" },
                 "graph": graph_prop()
@@ -694,15 +849,23 @@ pub fn tool_definitions() -> Vec<Value> {
         ),
         tool_def(
             "graph_architecture",
-            "Audit architectural layers, design pattern detections, module boundaries, or custom .graph-map/layers rules.",
+            "Audit architectural layers, design pattern detections, module boundaries, root nodes, or custom .graph-map/layers rules.",
             true,
             json!({
                 "project": project_prop(),
                 "scope": { "type": "string" },
                 "pattern": { "type": "string", "description": "Optional pattern key (e.g. 'layers@') or community filter." },
                 "modules": { "type": "boolean", "description": "Show graph community modules view instead of layer patterns." },
+                "no_incoming": { "type": "boolean", "description": "Mark nodes without incoming callers." },
                 "target": target_prop(),
+                "from": { "type": "string", "description": "Range start commit/branch/tag (used with 'to')." },
+                "to": { "type": "string", "description": "Range end commit/branch/tag (used with 'from')." },
                 "base": { "type": "string" },
+                "lod": lod_prop(),
+                "min_weight": min_weight_prop(),
+                "whole": { "type": "boolean" },
+                "offset": { "type": "integer", "minimum": 0 },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 500 },
                 "certain": { "type": "boolean" },
                 "notests": { "type": "boolean" },
                 "graph": graph_prop()
@@ -718,6 +881,8 @@ pub fn tool_definitions() -> Vec<Value> {
                 "entry": { "type": "string", "description": "Entrypoint file path or symbol key." },
                 "skip": { "type": "integer", "minimum": 0 },
                 "target": target_prop(),
+                "lod": lod_prop(),
+                "min_weight": min_weight_prop(),
                 "certain": { "type": "boolean" },
                 "notests": { "type": "boolean" },
                 "graph": graph_prop()
@@ -726,11 +891,13 @@ pub fn tool_definitions() -> Vec<Value> {
         ),
         tool_def(
             "graph_test_reach",
-            "Compute shortest transitive incoming paths from test files to changed source files for a target.",
+            "Compute shortest transitive incoming paths from test files to changed source files for a target or range.",
             true,
             json!({
                 "project": project_prop(),
                 "target": target_prop(),
+                "from": { "type": "string", "description": "Range start commit/branch/tag (used with 'to')." },
+                "to": { "type": "string", "description": "Range end commit/branch/tag (used with 'from')." },
                 "certain": { "type": "boolean" },
                 "graph": graph_prop()
             }),
@@ -746,6 +913,11 @@ pub fn tool_definitions() -> Vec<Value> {
                 "branch": { "type": "string" },
                 "query": { "type": "string" },
                 "skip": { "type": "integer", "minimum": 0 },
+                "target": target_prop(),
+                "lod": lod_prop(),
+                "min_weight": min_weight_prop(),
+                "certain": { "type": "boolean" },
+                "notests": { "type": "boolean" },
                 "graph": graph_prop()
             }),
             &[],
@@ -759,9 +931,55 @@ pub fn tool_definitions() -> Vec<Value> {
                 "session": { "type": "string", "description": "Optional run/session ID to inspect; omit to list runs." },
                 "launch": { "type": "string" },
                 "compare_launch": { "type": "string" },
+                "lod": lod_prop(),
+                "min_weight": min_weight_prop(),
                 "certain": { "type": "boolean" },
                 "notests": { "type": "boolean" },
                 "graph": graph_prop()
+            }),
+            &[],
+        ),
+        tool_def(
+            "graph_file_impact",
+            "Inspect blast radius, symbol diffs, callers/callees, and reaching tests for a single file.",
+            true,
+            json!({
+                "project": project_prop(),
+                "path": { "type": "string", "description": "Repository-relative path of the file to analyze." },
+                "target": target_prop(),
+                "from": { "type": "string", "description": "Range start commit/branch/tag (used with 'to')." },
+                "to": { "type": "string", "description": "Range end commit/branch/tag (used with 'from')." },
+                "focus_session": { "type": "string" },
+                "agent": { "type": "string" },
+                "certain": { "type": "boolean" }
+            }),
+            &["path"],
+        ),
+        tool_def(
+            "graph_memory_links",
+            "Look up Project Brain decisions/findings and Memory Bank chunks referencing one file or a batch of files.",
+            true,
+            json!({
+                "project": project_prop(),
+                "path": { "type": "string", "description": "Single repository-relative file path to query." },
+                "previous_path": { "type": "string", "description": "Optional previous path before rename." },
+                "files": {
+                    "type": "array",
+                    "description": "Batch list of file paths (strings or objects with 'path' and optional 'previous_path').",
+                    "items": {
+                        "anyOf": [
+                            { "type": "string" },
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "path": { "type": "string" },
+                                    "previous_path": { "type": "string" }
+                                },
+                                "required": ["path"]
+                            }
+                        ]
+                    }
+                }
             }),
             &[],
         ),

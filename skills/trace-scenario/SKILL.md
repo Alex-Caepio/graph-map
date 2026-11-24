@@ -19,9 +19,9 @@ Always pass `project: "<absolute-repository-root>"` explicitly to every `graph_*
    Call `graph_scenario` with `{ "project": "<repo-root>", "entry": "<file-or-symbol>", "notests": true }`.
    Use `skip` if paginated results contain many downstream hops.
 3. **Inspect shortest paths and detailed edges**:
-   - Call `graph_path` with `from` and `to` to extract the shortest directed dependency route between two components.
-   - Call `graph_link` with `from` and `to` to view symbol-to-symbol call edges, line numbers, and link confidence (`certain: true` for verified edges only).
-   - Call `graph_neighbors` with `node`, plus `out` / `into` arrays, to unfold upstream callers or downstream callees step by step.
+   - Call `graph_path` with `from` and `to` (plus optional `longer: 1..N`) to extract shortest and near-shortest directed dependency routes between two components.
+   - Call `graph_link` with `from` and `to` to view symbol-to-symbol call edges, line numbers, and link confidence (`certain: true` for statically extracted edges only).
+   - Call `graph_neighbors` with `node`, plus `depth` (`1..6`), `lod`, and `out` / `into` arrays, to unfold upstream callers or downstream callees step by step.
 
 ## Output Checklist
 

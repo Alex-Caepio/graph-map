@@ -1,10 +1,11 @@
 use crate::common::{
-    Engine, build_sharing, parse_followed, parse_side, parse_target, render_explanation, wait_settled,
+    Engine, build_or_import, build_sharing, parse_followed, parse_map_params, parse_side,
+    parse_target, parse_target_or_range, render_explanation,
 };
 use crate::{http, mcp};
-use graph_map_core::{GraphError, Result, graphs::Shown};
+use graph_map_core::{GraphError, MapQueryParams, Result, graphs::Shown};
 use serde_json::{Value, json};
-use std::{path::{Path, PathBuf}, sync::Arc, time::Duration};
+use std::{path::{Path, PathBuf}, sync::Arc};
 
 pub struct GlobalOpts {
     pub project: Option<String>,
@@ -142,14 +143,76 @@ pub fn run(args: &[String]) -> Result<()> {
             let notests = flags.contains_key("--notests") || flags.contains_key("--no-tests");
             engine.run_find(&project, &root, target.as_ref(), query, notests, graph_override)?
         }
+        "map" => {
+            let (_pos, flags) = split_flags(
+                cmd_args,
+                &[
+                    "--scope",
+                    "--focus",
+                    "--filter",
+                    "--target",
+                    "--from",
+                    "--to",
+                    "--focus-session",
+                    "--agent",
+                    "--depth",
+                    "--lod",
+                    "--min-weight",
+                    "--offset",
+                    "--limit",
+                    "--whole",
+                    "--patterns",
+                    "--modules",
+                    "--history",
+                    "--no-incoming",
+                    "--certain",
+                    "--notests",
+                    "--no-tests",
+                ],
+            );
+            let target = flags_target_or_range(&flags, None, None)?;
+            let mp = flags_map_params(&flags)?;
+            let shown = Shown {
+                scope: flag_str(&flags, "--scope").unwrap_or(""),
+                focus: flag_str(&flags, "--focus"),
+                focus_session: flag_str(&flags, "--focus-session"),
+                agent: flag_str(&flags, "--agent"),
+                filter: flag_str(&flags, "--filter").unwrap_or(""),
+                patterns: flags.contains_key("--patterns"),
+                modules: flags.contains_key("--modules"),
+                history: flags.contains_key("--history"),
+                no_incoming: flags.contains_key("--no-incoming"),
+                certain: flags.contains_key("--certain"),
+                notests: flags_notests(&flags),
+                whole: flags.contains_key("--whole"),
+                offset: mp.offset,
+                limit: mp.limit,
+                depth: mp.depth,
+                lod: mp.lod,
+                min_weight: mp.min_weight,
+                ..Shown::default()
+            };
+            engine.run_map(&project, &root, target.as_ref(), &shown, graph_override)?
+        }
         "neighbors" => {
             let (pos, flags) = split_flags(
                 cmd_args,
                 &[
                     "--scope",
                     "--target",
+                    "--from",
+                    "--to",
+                    "--focus-session",
+                    "--agent",
                     "--out",
                     "--into",
+                    "--depth",
+                    "--lod",
+                    "--min-weight",
+                    "--offset",
+                    "--limit",
+                    "--whole",
+                    "--no-incoming",
                     "--certain",
                     "--notests",
                     "--no-tests",
@@ -159,7 +222,8 @@ pub fn run(args: &[String]) -> Result<()> {
                 .first()
                 .map(String::as_str)
                 .ok_or_else(|| GraphError::invalid("Usage: graph-map neighbors <path-or-node>"))?;
-            let target = parse_target(flag_str(&flags, "--target"))?;
+            let target = flags_target_or_range(&flags, None, None)?;
+            let mp = flags_map_params(&flags)?;
             let out = flag_str(&flags, "--out")
                 .map(|s| s.split(',').map(str::to_owned).collect::<Vec<_>>())
                 .unwrap_or_default();
@@ -170,39 +234,79 @@ pub fn run(args: &[String]) -> Result<()> {
             let shown = Shown {
                 scope: flag_str(&flags, "--scope").unwrap_or(""),
                 focus: Some(node),
+                focus_session: flag_str(&flags, "--focus-session"),
+                agent: flag_str(&flags, "--agent"),
                 followed: followed.as_ref(),
+                no_incoming: flags.contains_key("--no-incoming"),
                 certain: flags.contains_key("--certain"),
-                notests: flags.contains_key("--notests") || flags.contains_key("--no-tests"),
+                notests: flags_notests(&flags),
+                whole: flags.contains_key("--whole"),
+                offset: mp.offset,
+                limit: mp.limit,
+                depth: mp.depth,
+                lod: mp.lod,
+                min_weight: mp.min_weight,
                 ..Shown::default()
             };
             engine.run_map(&project, &root, target.as_ref(), &shown, graph_override)?
         }
         "link" => {
-            let (pos, flags) =
-                split_flags(cmd_args, &["--target", "--certain", "--notests", "--no-tests"]);
+            let (pos, flags) = split_flags(
+                cmd_args,
+                &[
+                    "--target",
+                    "--base",
+                    "--lod",
+                    "--min-weight",
+                    "--certain",
+                    "--notests",
+                    "--no-tests",
+                ],
+            );
             if pos.len() < 2 {
                 return Err(GraphError::invalid("Usage: graph-map link <from> <to>"));
             }
             let target = parse_target(flag_str(&flags, "--target"))?;
+            let mp = flags_map_params(&flags)?;
             let shown = Shown {
                 link: Some((pos[0].as_str(), pos[1].as_str())),
+                base: flag_str(&flags, "--base"),
                 certain: flags.contains_key("--certain"),
-                notests: flags.contains_key("--notests") || flags.contains_key("--no-tests"),
+                notests: flags_notests(&flags),
+                lod: mp.lod,
+                min_weight: mp.min_weight,
                 ..Shown::default()
             };
             engine.run_map(&project, &root, target.as_ref(), &shown, graph_override)?
         }
         "path" => {
-            let (pos, flags) =
-                split_flags(cmd_args, &["--target", "--certain", "--notests", "--no-tests"]);
+            let (pos, flags) = split_flags(
+                cmd_args,
+                &[
+                    "--target",
+                    "--longer",
+                    "--lod",
+                    "--min-weight",
+                    "--certain",
+                    "--notests",
+                    "--no-tests",
+                ],
+            );
             if pos.len() < 2 {
                 return Err(GraphError::invalid("Usage: graph-map path <from> <to>"));
             }
             let target = parse_target(flag_str(&flags, "--target"))?;
+            let mp = flags_map_params(&flags)?;
+            let longer = flag_str(&flags, "--longer")
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(0);
             let shown = Shown {
                 path: Some((pos[0].as_str(), pos[1].as_str())),
+                longer,
                 certain: flags.contains_key("--certain"),
-                notests: flags.contains_key("--notests") || flags.contains_key("--no-tests"),
+                notests: flags_notests(&flags),
+                lod: mp.lod,
+                min_weight: mp.min_weight,
                 ..Shown::default()
             };
             engine.run_map(&project, &root, target.as_ref(), &shown, graph_override)?
@@ -213,6 +317,10 @@ pub fn run(args: &[String]) -> Result<()> {
                 &[
                     "--side",
                     "--skip",
+                    "--offset",
+                    "--limit",
+                    "--lod",
+                    "--min-weight",
                     "--target",
                     "--certain",
                     "--notests",
@@ -223,6 +331,7 @@ pub fn run(args: &[String]) -> Result<()> {
                 return Err(GraphError::invalid("Usage: graph-map shared <a> <b>"));
             }
             let target = parse_target(flag_str(&flags, "--target"))?;
+            let mp = flags_map_params(&flags)?;
             let users = parse_side(flag_str(&flags, "--side"))?;
             let skip = flag_str(&flags, "--skip")
                 .and_then(|s| s.parse::<usize>().ok())
@@ -231,7 +340,11 @@ pub fn run(args: &[String]) -> Result<()> {
             let shown = Shown {
                 shared: Some(sharing),
                 certain: flags.contains_key("--certain"),
-                notests: flags.contains_key("--notests") || flags.contains_key("--no-tests"),
+                notests: flags_notests(&flags),
+                offset: mp.offset,
+                limit: mp.limit,
+                lod: mp.lod,
+                min_weight: mp.min_weight,
                 ..Shown::default()
             };
             engine.run_map(&project, &root, target.as_ref(), &shown, graph_override)?
@@ -243,6 +356,8 @@ pub fn run(args: &[String]) -> Result<()> {
                     "--scope",
                     "--target",
                     "--base",
+                    "--lod",
+                    "--min-weight",
                     "--certain",
                     "--notests",
                     "--no-tests",
@@ -253,12 +368,15 @@ pub fn run(args: &[String]) -> Result<()> {
                 .map(String::as_str)
                 .ok_or_else(|| GraphError::invalid("Usage: graph-map cycles <node-or-path>"))?;
             let target = parse_target(flag_str(&flags, "--target"))?;
+            let mp = flags_map_params(&flags)?;
             let shown = Shown {
                 scope: flag_str(&flags, "--scope").unwrap_or(""),
                 cycle: Some(cycle),
                 base: flag_str(&flags, "--base"),
                 certain: flags.contains_key("--certain"),
-                notests: flags.contains_key("--notests") || flags.contains_key("--no-tests"),
+                notests: flags_notests(&flags),
+                lod: mp.lod,
+                min_weight: mp.min_weight,
                 ..Shown::default()
             };
             engine.run_map(&project, &root, target.as_ref(), &shown, graph_override)?
@@ -268,27 +386,104 @@ pub fn run(args: &[String]) -> Result<()> {
                 cmd_args,
                 &[
                     "--target",
+                    "--from",
+                    "--to",
                     "--scope",
                     "--focus",
+                    "--focus-session",
+                    "--agent",
                     "--base",
+                    "--lod",
+                    "--min-weight",
+                    "--offset",
+                    "--limit",
+                    "--whole",
                     "--certain",
                     "--notests",
                     "--no-tests",
                 ],
             );
-            let target_raw = flag_str(&flags, "--target")
-                .or_else(|| pos.first().map(String::as_str))
-                .unwrap_or("work");
-            let target = parse_target(Some(target_raw))?;
+            let target =
+                flags_target_or_range(&flags, pos.first().map(String::as_str), Some("work"))?;
+            let mp = flags_map_params(&flags)?;
             let shown = Shown {
                 scope: flag_str(&flags, "--scope").unwrap_or(""),
                 focus: flag_str(&flags, "--focus"),
+                focus_session: flag_str(&flags, "--focus-session"),
+                agent: flag_str(&flags, "--agent"),
                 base: flag_str(&flags, "--base"),
                 certain: flags.contains_key("--certain"),
-                notests: flags.contains_key("--notests") || flags.contains_key("--no-tests"),
+                notests: flags_notests(&flags),
+                whole: flags.contains_key("--whole"),
+                offset: mp.offset,
+                limit: mp.limit,
+                lod: mp.lod,
+                min_weight: mp.min_weight,
                 ..Shown::default()
             };
             engine.run_map(&project, &root, target.as_ref(), &shown, graph_override)?
+        }
+        "changes" => {
+            let (pos, flags) = split_flags(
+                cmd_args,
+                &[
+                    "--target",
+                    "--from",
+                    "--to",
+                    "--focus-session",
+                    "--agent",
+                    "--notests",
+                    "--no-tests",
+                ],
+            );
+            let target =
+                flags_target_or_range(&flags, pos.first().map(String::as_str), Some("work"))?;
+            engine.graphs.changes_catalog_with_agent(
+                &project,
+                target.as_ref(),
+                flag_str(&flags, "--focus-session"),
+                flag_str(&flags, "--agent"),
+                flags_notests(&flags),
+            )?
+        }
+        "file-impact" => {
+            let (pos, flags) = split_flags(
+                cmd_args,
+                &[
+                    "--target",
+                    "--from",
+                    "--to",
+                    "--focus-session",
+                    "--agent",
+                    "--certain",
+                ],
+            );
+            let file_path = pos
+                .first()
+                .map(String::as_str)
+                .ok_or_else(|| GraphError::invalid("Usage: graph-map file-impact <path> [<target>]"))?;
+            let target =
+                flags_target_or_range(&flags, pos.get(1).map(String::as_str), Some("work"))?;
+            engine.graphs.file_impact_with_agent(
+                &project,
+                file_path,
+                target.as_ref(),
+                flag_str(&flags, "--focus-session"),
+                flag_str(&flags, "--agent"),
+                flags.contains_key("--certain"),
+            )?
+        }
+        "memory-links" => {
+            let (pos, flags) = split_flags(cmd_args, &["--previous"]);
+            let file_path = pos
+                .first()
+                .map(String::as_str)
+                .ok_or_else(|| GraphError::invalid("Usage: graph-map memory-links <path> [--previous <prev>]"))?;
+            let mut query = json!({ "path": file_path });
+            if let Some(prev) = flag_str(&flags, "--previous") {
+                query["previous_path"] = json!(prev);
+            }
+            engine.graphs.memory_links(&project, &query)?
         }
         "layers" => {
             let (pos, flags) = split_flags(
@@ -297,14 +492,23 @@ pub fn run(args: &[String]) -> Result<()> {
                     "--scope",
                     "--pattern",
                     "--modules",
+                    "--no-incoming",
                     "--target",
+                    "--from",
+                    "--to",
                     "--base",
+                    "--lod",
+                    "--min-weight",
+                    "--offset",
+                    "--limit",
+                    "--whole",
                     "--certain",
                     "--notests",
                     "--no-tests",
                 ],
             );
-            let target = parse_target(flag_str(&flags, "--target"))?;
+            let target = flags_target_or_range(&flags, None, None)?;
+            let mp = flags_map_params(&flags)?;
             let pattern = flag_str(&flags, "--pattern").or_else(|| pos.first().map(String::as_str));
             let modules = flags.contains_key("--modules");
             let shown = Shown {
@@ -312,9 +516,15 @@ pub fn run(args: &[String]) -> Result<()> {
                 patterns: pattern.is_none() && !modules,
                 pattern,
                 modules,
+                no_incoming: flags.contains_key("--no-incoming"),
                 base: flag_str(&flags, "--base"),
                 certain: flags.contains_key("--certain"),
-                notests: flags.contains_key("--notests") || flags.contains_key("--no-tests"),
+                notests: flags_notests(&flags),
+                whole: flags.contains_key("--whole"),
+                offset: mp.offset,
+                limit: mp.limit,
+                lod: mp.lod,
+                min_weight: mp.min_weight,
                 ..Shown::default()
             };
             engine.run_map(&project, &root, target.as_ref(), &shown, graph_override)?
@@ -325,6 +535,8 @@ pub fn run(args: &[String]) -> Result<()> {
                 &[
                     "--skip",
                     "--target",
+                    "--lod",
+                    "--min-weight",
                     "--certain",
                     "--notests",
                     "--no-tests",
@@ -335,23 +547,25 @@ pub fn run(args: &[String]) -> Result<()> {
                 .map(String::as_str)
                 .ok_or_else(|| GraphError::invalid("Usage: graph-map scenario <entry>"))?;
             let target = parse_target(flag_str(&flags, "--target"))?;
+            let mp = flags_map_params(&flags)?;
             let skip = flag_str(&flags, "--skip")
                 .and_then(|s| s.parse::<usize>().ok())
                 .unwrap_or(0);
             let shown = Shown {
                 scenario: Some((entry, skip)),
                 certain: flags.contains_key("--certain"),
-                notests: flags.contains_key("--notests") || flags.contains_key("--no-tests"),
+                notests: flags_notests(&flags),
+                lod: mp.lod,
+                min_weight: mp.min_weight,
                 ..Shown::default()
             };
             engine.run_map(&project, &root, target.as_ref(), &shown, graph_override)?
         }
         "test-reach" => {
-            let (pos, flags) = split_flags(cmd_args, &["--target", "--certain"]);
-            let target_raw = flag_str(&flags, "--target")
-                .or_else(|| pos.first().map(String::as_str))
-                .unwrap_or("work");
-            let target = parse_target(Some(target_raw))?;
+            let (pos, flags) =
+                split_flags(cmd_args, &["--target", "--from", "--to", "--certain"]);
+            let target =
+                flags_target_or_range(&flags, pos.first().map(String::as_str), Some("work"))?;
             let shown = Shown {
                 certain: flags.contains_key("--certain"),
                 ..Shown::default()
@@ -366,14 +580,34 @@ pub fn run(args: &[String]) -> Result<()> {
             })
         }
         "hotspots" => {
-            let (_pos, flags) =
-                split_flags(cmd_args, &["--scope", "--branch", "--query", "--skip"]);
+            let (_pos, flags) = split_flags(
+                cmd_args,
+                &[
+                    "--scope",
+                    "--branch",
+                    "--query",
+                    "--skip",
+                    "--target",
+                    "--lod",
+                    "--min-weight",
+                    "--certain",
+                    "--notests",
+                    "--no-tests",
+                ],
+            );
+            let target = parse_target(flag_str(&flags, "--target"))?;
+            let mp = flags_map_params(&flags)?;
             let shown = Shown {
                 scope: flag_str(&flags, "--scope").unwrap_or(""),
                 history: true,
+                certain: flags.contains_key("--certain"),
+                notests: flags_notests(&flags),
+                lod: mp.lod,
+                min_weight: mp.min_weight,
                 ..Shown::default()
             };
-            let view = engine.run_map(&project, &root, None, &shown, graph_override)?;
+            let view =
+                engine.run_map(&project, &root, target.as_ref(), &shown, graph_override)?;
             let skip = flag_str(&flags, "--skip")
                 .and_then(|s| s.parse::<usize>().ok())
                 .unwrap_or(0);
@@ -394,6 +628,8 @@ pub fn run(args: &[String]) -> Result<()> {
                 &[
                     "--launch",
                     "--compare",
+                    "--lod",
+                    "--min-weight",
                     "--certain",
                     "--notests",
                     "--no-tests",
@@ -401,11 +637,14 @@ pub fn run(args: &[String]) -> Result<()> {
             );
             if let Some(session_id) = pos.first() {
                 let target = parse_target(Some(&format!("run:{session_id}")))?;
+                let mp = flags_map_params(&flags)?;
                 let shown = Shown {
                     launch: flag_str(&flags, "--launch"),
                     compare_launch: flag_str(&flags, "--compare"),
                     certain: flags.contains_key("--certain"),
-                    notests: flags.contains_key("--notests") || flags.contains_key("--no-tests"),
+                    notests: flags_notests(&flags),
+                    lod: mp.lod,
+                    min_weight: mp.min_weight,
                     ..Shown::default()
                 };
                 engine.run_map(&project, &root, target.as_ref(), &shown, graph_override)?
@@ -432,7 +671,7 @@ pub fn run(args: &[String]) -> Result<()> {
                 from,
                 to,
                 flags.contains_key("--certain"),
-                flags.contains_key("--notests") || flags.contains_key("--no-tests"),
+                flags_notests(&flags),
             )?;
             json!({
                 "raw": raw,
@@ -453,6 +692,37 @@ pub fn run(args: &[String]) -> Result<()> {
         print_human(cmd, &output);
     }
     Ok(())
+}
+
+fn flags_notests(flags: &std::collections::BTreeMap<String, Option<String>>) -> bool {
+    flags.contains_key("--notests") || flags.contains_key("--no-tests")
+}
+
+fn flags_map_params(
+    flags: &std::collections::BTreeMap<String, Option<String>>,
+) -> Result<MapQueryParams> {
+    parse_map_params(
+        flag_str(flags, "--offset"),
+        flag_str(flags, "--limit"),
+        flag_str(flags, "--depth"),
+        flag_str(flags, "--lod"),
+        flag_str(flags, "--min-weight"),
+    )
+}
+
+fn flags_target_or_range(
+    flags: &std::collections::BTreeMap<String, Option<String>>,
+    positional: Option<&str>,
+    default_target: Option<&str>,
+) -> Result<Option<graph_map_core::graph_changes::Target>> {
+    let from = flag_str(flags, "--from");
+    let to = flag_str(flags, "--to");
+    let explicit_target = flag_str(flags, "--target").or(positional);
+    if from.is_some() || to.is_some() {
+        parse_target_or_range(explicit_target, from, to)
+    } else {
+        parse_target(explicit_target.or(default_target))
+    }
 }
 
 fn handle_build(engine: &Engine, project: &str, root: &Path, args: &[String]) -> Result<Value> {
@@ -483,31 +753,8 @@ fn handle_build(engine: &Engine, project: &str, root: &Path, args: &[String]) ->
     }
 
     let wait = !flags.contains_key("--no-wait");
-    let current = engine.graphs.status(project, false)?;
-    let action = if current["enabled"] == true && flags.contains_key("--rebuild") {
-        "rebuild"
-    } else {
-        "enable"
-    };
-    if current["enabled"] == true && !flags.contains_key("--rebuild") {
-        return Ok(current);
-    }
-    match engine.graphs.act(project, action) {
-        Ok(status) => {
-            if wait && status["build"].is_object() {
-                wait_settled(&engine.graphs, project, Duration::from_secs(120))
-            } else {
-                Ok(status)
-            }
-        }
-        Err(error) => {
-            if let Some(imported) = engine.ensure_graph_or_import(project, root)? {
-                Ok(imported)
-            } else {
-                Err(error)
-            }
-        }
-    }
+    let rebuild = flags.contains_key("--rebuild");
+    build_or_import(engine, project, root, rebuild, wait)
 }
 
 fn next_arg(args: &[String], index: &mut usize, name: &str) -> Result<String> {
@@ -528,8 +775,32 @@ fn split_flags(
     known_flags: &[&str],
 ) -> (Vec<String>, std::collections::BTreeMap<String, Option<String>>) {
     let value_flags = [
-        "--target", "--scope", "--out", "--into", "--side", "--skip", "--base", "--focus",
-        "--pattern", "--branch", "--query", "--launch", "--compare", "--import", "--to",
+        "--target",
+        "--from",
+        "--to",
+        "--scope",
+        "--filter",
+        "--focus",
+        "--focus-session",
+        "--agent",
+        "--out",
+        "--into",
+        "--side",
+        "--skip",
+        "--offset",
+        "--limit",
+        "--depth",
+        "--lod",
+        "--min-weight",
+        "--longer",
+        "--base",
+        "--pattern",
+        "--branch",
+        "--query",
+        "--launch",
+        "--compare",
+        "--import",
+        "--previous",
     ];
     let mut pos = Vec::new();
     let mut flags = std::collections::BTreeMap::new();
@@ -608,14 +879,18 @@ USAGE:
 
 COMMANDS:
   status [--check]                   Show graph availability, counts, and staleness
-  build [--import <path>] [--rebuild] Build, rebuild, or import graph.json
+  build [--import <path>] [--rebuild] Build native AST/SQLite IR graph (or import graph.json)
+  map [--lod <level>] [--min-weight] Slice graph at overview|folder|file|symbol LOD
   find <query> [--target <t>]        Search files, folders, classes, and functions
-  neighbors <node> [--out ...]       Inspect callers, callees, and step-by-step unfolding
+  neighbors <node> [--out ...]       Inspect callers, callees, depth, and step unfolding
   link <from> <to>                   Inspect symbol edges between two places
-  path <from> <to>                   Find shortest directed path between two places
+  path <from> <to> [--longer <n>]    Find shortest (or near-shortest) directed paths
   shared <a> <b> [--side ...]        Show shared dependencies or shared callers
   cycles <node>                      Trace shortest cycle back to an origin
-  impact [<target>]                  Map changes (work|uncommitted|commit:..|branch:..|pull:..|run:..)
+  impact [<target>] [--from <a> --to <b>] Map changes (work|uncommitted|commit:..|ref:..|pr:..|range:..|run:..)
+  changes [<target>] [--from <a> --to <b>] Compact changed files & symbol diffs catalog
+  file-impact <path> [<target>]      Detailed blast radius & reaching tests for one file
+  memory-links <path>                Look up Project Brain & Memory Bank citations for a file
   layers [<pattern>] [--modules]     Inspect architectural layers, patterns, or modules
   scenario <entry> [--skip <n>]      Trace downstream call scenario from an entry point
   test-reach [<target>]              Find shortest incoming paths from tests to changed files
@@ -623,7 +898,7 @@ COMMANDS:
   runs [<session-id>]                List or audit recorded Claude/Codex/Harness runs
   explain <from> [--to <to>]         Render markdown summary for a node or link
   serve [--host <ip>] [--port <n>]   Start standalone localhost Web UI + HTTP API
-  mcp                                Run stdio JSON-RPC 2.0 MCP server (14 tools)
+  mcp                                Run stdio JSON-RPC 2.0 MCP server (16 tools)
 
 OPTIONS:
   -h, --help                         Show this help message
