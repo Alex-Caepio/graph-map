@@ -180,16 +180,23 @@ impl Engine {
 }
 
 fn has_plugin_markers(dir: &Path) -> bool {
-    let s = dir.to_string_lossy();
-    s.contains("/.codex/plugins/cache/")
-        || s.contains("\\.codex\\plugins\\cache\\")
-        || s.contains("/.claude/plugins/cache/")
-        || s.contains("\\.claude\\plugins\\cache\\")
+    let norm = dir.to_string_lossy().replace('\\', "/");
+    let has_bin = dir.join("bin").join("graph-map").is_file()
+        || dir.join("bin").join("graph-map.exe").is_file();
+    norm.contains("/.codex/plugins/cache/")
+        || norm.ends_with("/.codex/plugins/cache")
+        || norm.contains("/.claude/plugins/cache/")
+        || norm.ends_with("/.claude/plugins/cache")
+        || norm.contains("/.gemini/config/plugins/")
+        || norm.ends_with("/.gemini/config/plugins")
         || dir.join(".codex-plugin").join("plugin.json").is_file()
         || dir.join(".claude-plugin").join("plugin.json").is_file()
+        || dir.join(".antigravity-plugin").join("plugin.json").is_file()
+        || dir.join(".gemini-plugin").join("plugin.json").is_file()
         || dir.join(".claude-plugin").join("marketplace.json").is_file()
         || dir.join(".agents").join("plugins").join("marketplace.json").is_file()
-        || (dir.join(".mcp.json").is_file() && dir.join("bin").join("graph-map").is_file())
+        || (dir.join("plugin.json").is_file() && (dir.join("mcp_config.json").is_file() || has_bin))
+        || ((dir.join(".mcp.json").is_file() || dir.join("mcp_config.json").is_file()) && has_bin)
 }
 
 fn looks_like_plugin_cache(path: &Path) -> bool {

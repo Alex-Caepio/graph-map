@@ -360,31 +360,55 @@ fn cli_and_mcp_16_tools_and_plugin_cwd_guard() {
     drop(g_in);
     let _ = guard_child.wait();
 
-    // Isolated `.codex/plugins/cache/...` cwd (no parent `.git`) also enforces the guard.
+    // Isolated `.codex/plugins/cache/...` and `.gemini/config/plugins/...` (Antigravity) cwds also enforce the guard.
     let fake_cache = tmp.path().join(".codex/plugins/cache/mkt/graph-map/0.2.0");
     fs::create_dir_all(&fake_cache).unwrap();
-    let mut cache_child = Command::new(bin)
-        .args(["--state", state.to_str().unwrap(), "mcp"])
-        .current_dir(&fake_cache)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
+    let fake_agy = tmp.path().join(".gemini/config/plugins/graph-map");
+    fs::create_dir_all(fake_agy.join("bin")).unwrap();
+    fs::write(fake_agy.join("plugin.json"), "{\"name\":\"graph-map\"}").unwrap();
+    fs::write(fake_agy.join("mcp_config.json"), "{\"mcpServers\":{}}").unwrap();
+    fs::write(fake_agy.join("bin/graph-map"), b"").unwrap();
+    let agy_root_only = tmp.path().join("ext-agy-marker");
+    fs::create_dir_all(agy_root_only.join(".antigravity-plugin")).unwrap();
+    fs::write(agy_root_only.join(".antigravity-plugin/plugin.json"), "{\"name\":\"graph-map\"}").unwrap();
+
+    for guard_cwd in [&fake_cache, &fake_agy, &agy_root_only] {
+        let mut cache_child = Command::new(bin)
+            .args(["--state", state.to_str().unwrap(), "mcp"])
+            .current_dir(guard_cwd)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut c_in = cache_child.stdin.take().unwrap();
+        let mut c_out = BufReader::new(cache_child.stdout.take().unwrap());
+        for bad in [json!({}), json!({"project": "."}), json!({"project": "./."})] {
+            writeln!(
+                c_in,
+                "{}",
+                json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"graph_status","arguments": bad}})
+            )
+            .unwrap();
+            c_in.flush().unwrap();
+            let mut line = String::new();
+            c_out.read_line(&mut line).unwrap();
+            let cache_resp: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(cache_resp["result"]["isError"], true, "{guard_cwd:?} {bad}: {cache_resp}");
+        }
+        writeln!(
+            c_in,
+            "{}",
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"graph_status","arguments":{"project": p}}})
+        )
         .unwrap();
-    let mut c_in = cache_child.stdin.take().unwrap();
-    let mut c_out = BufReader::new(cache_child.stdout.take().unwrap());
-    writeln!(
-        c_in,
-        "{}",
-        json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"graph_build","arguments":{"project":"."}}})
-    )
-    .unwrap();
-    c_in.flush().unwrap();
-    let mut line = String::new();
-    c_out.read_line(&mut line).unwrap();
-    let cache_resp: Value = serde_json::from_str(&line).unwrap();
-    assert_eq!(cache_resp["result"]["isError"], true, "{cache_resp}");
-    drop(c_in);
-    let _ = cache_child.wait();
+        c_in.flush().unwrap();
+        let mut ok_line = String::new();
+        c_out.read_line(&mut ok_line).unwrap();
+        let ok_resp: Value = serde_json::from_str(&ok_line).unwrap();
+        assert_eq!(ok_resp["result"]["isError"], false, "{guard_cwd:?}: {ok_resp}");
+        drop(c_in);
+        let _ = cache_child.wait();
+    }
 }
 
 fn free_port() -> u16 {
